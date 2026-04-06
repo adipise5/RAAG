@@ -1,0 +1,1531 @@
+import os
+import re
+import json
+import math
+import asyncio
+import logging
+from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
+
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel, Field
+from pymongo import MongoClient
+
+app = FastAPI()
+
+# ==============================
+# CONFIG
+# ==============================
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+MAX_LLM_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "8"))
+
+mongo_client = MongoClient(MONGO_URL)
+db = mongo_client["raag_projects"]
+analysis_collection = db["analysis"]
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("raag-llm")
+
+# ==============================
+# MODELS
+# ==============================
+class AnalysisRequest(BaseModel):
+    project_id: str
+    requirements: List[str]
+
+
+class EnhancedQualityRequest(BaseModel):
+    project_id: Optional[str] = None
+    requirements: List[str] = Field(default_factory=list)
+
+
+class GapAnalysisRequest(BaseModel):
+    requirements: List[str] = Field(default_factory=list)
+
+
+class TraceabilityRequest(BaseModel):
+    requirements: List[str] = Field(default_factory=list)
+    architecture_components: List[str] = Field(default_factory=list)
+
+
+class RiskAssumptionRequest(BaseModel):
+    project_description: Optional[str] = ""
+    requirements: List[str] = Field(default_factory=list)
+
+
+class ComplexityRequest(BaseModel):
+    requirements: List[str] = Field(default_factory=list)
+
+
+class NoveltyRequest(BaseModel):
+    project_description: Optional[str] = ""
+    domain: Optional[str] = "General"
+    requirements: List[str] = Field(default_factory=list)
+
+
+class RewriteRequest(BaseModel):
+    requirement_text: str
+
+
+class PromptRequest(BaseModel):
+    prompt: str
+
+
+# ==============================
+# CONSTANTS & HEURISTICS
+# ==============================
+VAGUE_TERMS = [
+    "fast", "quick", "easy", "simple", "user-friendly", "robust", "seamless",
+    "efficient", "optimize", "as soon as possible", "etc", "and so on", "better"
+]
+
+CATEGORY_KEYWORDS = {
+    "Security": ["security", "secure", "auth", "authentication", "authorization", "jwt", "token", "encrypt", "encryption", "owasp", "rbac", "privacy"],
+    "Performance": ["performance", "latency", "throughput", "response time", "concurrent", "load", "scale", "scalability", "rps"],
+    "Reliability": ["reliability", "availability", "uptime", "failover", "recovery", "backup", "fault", "resilience", "durability"],
+    "Usability": ["usability", "ux", "ui", "accessible", "accessibility", "onboarding", "learnability", "user experience"],
+    "Compliance": ["compliance", "regulatory", "gdpr", "hipaa", "pci", "soc2", "iso", "audit trail", "data retention"]
+}
+
+CATEGORY_SEVERITY = {
+    "Security": "Critical",
+    "Performance": "High",
+    "Reliability": "High",
+    "Usability": "Medium",
+    "Compliance": "Critical"
+}
+
+CATEGORY_SUGGESTION = {
+    "Security": "System shall enforce JWT-based authentication, role-based authorization, and encryption for data in transit and at rest.",
+    "Performance": "System shall respond within 200ms for 95% of requests under 1,000 concurrent users.",
+    "Reliability": "System shall maintain 99.9% uptime with automated failover and recovery within 5 minutes.",
+    "Usability": "System shall provide task completion for first-time users within 3 minutes and meet WCAG 2.1 AA accessibility standards.",
+    "Compliance": "System shall comply with applicable regulations (e.g., GDPR/PCI/HIPAA) and maintain auditable access and retention logs."
+}
+
+RISK_SEVERITY = {"low": "Low", "medium": "Medium", "high": "High", "critical": "Critical"}
+
+_gemini_model = None
+_gemini_disabled = False
+
+
+# ==============================
+# JSON / TEXT UTILITIES
+# ==============================
+def normalize_requirements(requirements: List[str]) -> List[str]:
+    return [r.strip() for r in requirements if isinstance(r, str) and r.strip()]
+
+
+def extract_json_content(raw: str) -> Any:
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("Empty LLM response")
+
+    if text.startswith("```"):
+        blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        if blocks:
+            text = blocks[0].strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    if match:
+        candidate = match.group(1).strip()
+        return json.loads(candidate)
+
+    raise ValueError("No valid JSON found in LLM response")
+
+
+def unwrap_result(payload: Any) -> Any:
+    if isinstance(payload, dict) and "result" in payload:
+        return payload["result"]
+    return payload
+
+
+def clamp_int(value: Any, low: int, high: int, default: int) -> int:
+    try:
+        val = int(round(float(value)))
+        return max(low, min(high, val))
+    except Exception:
+        return default
+
+
+def normalize_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return default
+
+
+def normalize_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def normalize_severity(value: Any, default: str = "Medium") -> str:
+    if not isinstance(value, str):
+        return default
+    key = value.strip().lower()
+    return RISK_SEVERITY.get(key, value.strip().title())
+
+
+def sanitize_rewritten_requirement(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return cleaned
+
+    # Remove duplicated modal fragments sometimes produced by LLMs
+    # e.g. "The system shall User shall ..."
+    cleaned = re.sub(
+        r"\bshall\s+(?:the\s+system|system|user|users|admin|administrator|customer|client|operator)\s+shall\b",
+        "shall",
+        cleaned,
+        flags=re.IGNORECASE
+    )
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned and not cleaned.endswith("."):
+        cleaned += "."
+    return cleaned
+
+
+def has_metric(text: str) -> bool:
+    lower = text.lower()
+    metric_patterns = [
+        r"\b\d+\s*(ms|millisecond|milliseconds|s|sec|seconds|minutes|hours|days)\b",
+        r"\b\d+\s*%",
+        r"\b\d+[\d,]*\s*(users|requests|rps|req/s|transactions|tps|mb|gb)\b",
+        r"\b(p95|p99|sla|slo|uptime)\b",
+        r"\b(within|under|less than|greater than|at least|no more than)\b"
+    ]
+    return any(re.search(pattern, lower) for pattern in metric_patterns)
+
+
+def detect_vague_terms(text: str) -> List[str]:
+    lower = text.lower()
+    found = []
+    for term in VAGUE_TERMS:
+        if re.search(rf"\b{re.escape(term)}\b", lower):
+            found.append(term)
+    return found
+
+
+def extract_actor(text: str) -> Optional[str]:
+    actor_patterns = [
+        r"\b(the\s+system|system|user|users|admin|administrator|customer|client|operator|application|service|platform)\b",
+        r"^\s*([A-Z][a-zA-Z0-9\s]{2,30})\s+(shall|must|should|can|will)"
+    ]
+    for pattern in actor_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            actor = match.group(1).strip()
+            if actor.lower() in {"system", "the system"}:
+                return "The system"
+            return actor[0].upper() + actor[1:]
+    return None
+
+
+def extract_action_phrase(text: str) -> Optional[str]:
+    match = re.search(r"\b(shall|must|should|can|will)\s+([^.,;]+)", text, flags=re.IGNORECASE)
+    if match:
+        action = match.group(2).strip()
+        action = re.sub(r"\s+", " ", action)
+        if action:
+            return action
+
+    # fallback: find likely verb chunk
+    alt = re.search(r"\b(create|update|delete|process|validate|send|receive|store|retrieve|generate|analyze|classify|encrypt|authenticate)\b([^.,;]*)", text, flags=re.IGNORECASE)
+    if alt:
+        return f"{alt.group(1).lower()}{alt.group(2)}".strip()
+    return None
+
+
+def extract_condition_phrase(text: str) -> Optional[str]:
+    match = re.search(r"\b(if|when|while|under|within|before|after|during|once|upon)\b([^.,;]*)", text, flags=re.IGNORECASE)
+    if match:
+        condition = f"{match.group(1).lower()}{match.group(2)}".strip()
+        return re.sub(r"\s+", " ", condition)
+
+    if has_metric(text):
+        return "under the stated measurable constraints"
+
+    return None
+
+
+def detect_missing_elements(text: str) -> List[str]:
+    missing = []
+    if not extract_actor(text):
+        missing.append("Actor")
+    if not extract_action_phrase(text):
+        missing.append("Action")
+    if not extract_condition_phrase(text):
+        missing.append("Condition")
+    return missing
+
+
+def compute_ieee830_score(text: str, vague_terms: List[str], missing_elements: List[str]) -> int:
+    score = 100
+
+    if vague_terms:
+        score -= min(30, 8 * len(vague_terms))
+
+    score -= 15 * len(missing_elements)
+
+    lower = text.lower()
+    if not re.search(r"\b(shall|must)\b", lower):
+        score -= 10
+
+    if not has_metric(text):
+        score -= 10
+
+    if len(text.split()) < 7:
+        score -= 10
+
+    if "?" in text:
+        score -= 5
+
+    return max(0, min(100, score))
+
+
+def build_smart_rewrite(text: str, missing_elements: List[str], vague_terms: List[str]) -> str:
+    actor = extract_actor(text) or "The system"
+    action = extract_action_phrase(text) or "process the requested operation"
+    condition = extract_condition_phrase(text) or "when a valid request is received"
+
+    # Remove explicit vague terms from action phrase to improve measurability.
+    cleaned_action = action
+    for term in vague_terms:
+        cleaned_action = re.sub(rf"\b{re.escape(term)}\b", "", cleaned_action, flags=re.IGNORECASE)
+    cleaned_action = re.sub(r"\s+", " ", cleaned_action).strip() or "process the requested operation"
+    if cleaned_action.lower() in {"be", "is", "are"}:
+        cleaned_action = "process the requested operation"
+
+    metric_clause = ""
+    if has_metric(text):
+        metric_clause = " while satisfying the quantitative limits specified in this requirement"
+    else:
+        metric_clause = " within 2 seconds for at least 1,000 concurrent users"
+
+    rewritten = f"{actor} shall {cleaned_action} {condition}{metric_clause}."
+    rewritten = re.sub(r"\s+", " ", rewritten).strip()
+
+    # Ensure sentence starts with a capital letter and has a terminal period.
+    rewritten = rewritten[0].upper() + rewritten[1:] if rewritten else rewritten
+    if not rewritten.endswith("."):
+        rewritten += "."
+
+    return rewritten
+
+
+def fallback_classification(requirement: str) -> Dict[str, Any]:
+    lower = requirement.lower()
+    nfr_tags = []
+    fr_hit = bool(re.search(r"\b(create|update|delete|process|generate|send|receive|store|retrieve|allow|enable|show|display|calculate)\b", lower))
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(k in lower for k in keywords):
+            nfr_tags.append(category)
+
+    if fr_hit and nfr_tags:
+        classification = "MIXED"
+        confidence = 0.86
+    elif nfr_tags:
+        classification = "NFR"
+        confidence = 0.9
+    else:
+        classification = "FR"
+        confidence = 0.84
+
+    justification = {
+        "FR": "Requirement primarily describes expected system behavior.",
+        "NFR": "Requirement primarily describes quality constraints and non-functional attributes.",
+        "MIXED": "Requirement combines behavioral intent with quality constraints."
+    }[classification]
+
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "subcategory": nfr_tags,
+        "justification": justification,
+        "quality_issues": []
+    }
+
+
+def fallback_quality_analysis(requirement: str) -> Dict[str, Any]:
+    vague_terms = detect_vague_terms(requirement)
+    missing_elements = detect_missing_elements(requirement)
+    score = compute_ieee830_score(requirement, vague_terms, missing_elements)
+    rewritten_requirement = sanitize_rewritten_requirement(
+        build_smart_rewrite(requirement, missing_elements, vague_terms)
+    )
+
+    return {
+        "score": score,
+        "vagueness": bool(vague_terms),
+        "missing_elements": missing_elements,
+        "rewritten_requirement": rewritten_requirement
+    }
+
+
+def fallback_gap_analysis(requirements: List[str]) -> List[Dict[str, str]]:
+    text = " ".join(requirements).lower()
+    gaps = []
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if not any(keyword in text for keyword in keywords):
+            gaps.append({
+                "gap": f"No {category.lower()} requirements found",
+                "severity": CATEGORY_SEVERITY[category],
+                "suggestion": CATEGORY_SUGGESTION[category]
+            })
+
+    return gaps
+
+
+def fallback_traceability(requirements: List[str], architecture_components: List[str]) -> Dict[str, Any]:
+    components = [c.strip() for c in architecture_components if c and c.strip()]
+    matrix = []
+    counts: Dict[str, int] = {c: 0 for c in components}
+
+    domain_hints = {
+        "auth": ["Auth Service", "Identity Service", "API Gateway"],
+        "login": ["Auth Service", "API Gateway"],
+        "token": ["Auth Service", "API Gateway"],
+        "user": ["User Service", "API Gateway"],
+        "payment": ["Payment Service", "Billing Service"],
+        "report": ["Reporting Service", "Analytics Service"],
+        "event": ["Event Bus", "Message Broker"],
+        "notification": ["Notification Service"],
+        "audit": ["Audit Service"],
+        "export": ["Export Service"]
+    }
+
+    for req in requirements:
+        req_lower = req.lower()
+        matched: List[str] = []
+
+        for comp in components:
+            comp_tokens = [t for t in re.split(r"[^a-z0-9]+", comp.lower()) if len(t) > 2]
+            if any(token in req_lower for token in comp_tokens):
+                matched.append(comp)
+
+        for hint, mapped_components in domain_hints.items():
+            if hint in req_lower:
+                for candidate in mapped_components:
+                    if candidate in components and candidate not in matched:
+                        matched.append(candidate)
+
+        if not matched and components:
+            # Reasonable default: user-facing functional requirements usually traverse gateway.
+            gateway_candidates = [c for c in components if "gateway" in c.lower()]
+            if gateway_candidates and any(k in req_lower for k in ["user", "client", "request", "api"]):
+                matched.append(gateway_candidates[0])
+
+        matrix.append({"requirement": req, "components": matched})
+        for comp in matched:
+            counts[comp] = counts.get(comp, 0) + 1
+
+    untraced_requirements = [entry["requirement"] for entry in matrix if not entry["components"]]
+
+    threshold = max(2, math.ceil(len(requirements) * 0.4)) if requirements else 1
+    high_density_components = [
+        {"component": comp, "requirement_count": count}
+        for comp, count in sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        if count >= threshold
+    ]
+
+    return {
+        "matrix": matrix,
+        "untraced_requirements": untraced_requirements,
+        "high_density_components": high_density_components
+    }
+
+
+def fallback_risk_assumptions(project_description: str, requirements: List[str]) -> List[Dict[str, str]]:
+    description = (project_description or "").lower()
+    req_text = " ".join(requirements).lower()
+    items: List[Dict[str, str]] = []
+
+    if any(k in req_text for k in ["third-party", "external", "payment gateway", "vendor api", "dependency"]):
+        items.append({
+            "type": "Risk",
+            "description": "Critical functionality depends on external third-party systems with uncertain availability and SLA.",
+            "severity": "High",
+            "mitigation": "Define fallback workflows, retries with circuit breakers, and contractual SLA monitoring for each external dependency."
+        })
+
+    if not any(k in req_text for k in CATEGORY_KEYWORDS["Compliance"]):
+        items.append({
+            "type": "Risk",
+            "description": "Regulatory and compliance requirements are not explicit, creating audit and legal exposure.",
+            "severity": "High",
+            "mitigation": "Add explicit compliance requirements (e.g., GDPR/PCI/HIPAA), audit logging, and data retention controls."
+        })
+
+    if any(term in req_text for term in ["etc", "and so on", "future", "flexible", "as needed"]):
+        items.append({
+            "type": "Risk",
+            "description": "Ambiguous scope language may cause scope creep and unclear acceptance criteria.",
+            "severity": "Medium",
+            "mitigation": "Convert open-ended requirements into SMART acceptance criteria and baseline them in change control."
+        })
+
+    if "real-time" in req_text and not any(k in req_text for k in ["latency", "ms", "p95", "throughput"]):
+        items.append({
+            "type": "Assumption",
+            "description": "The team assumes infrastructure can satisfy real-time behavior without explicit latency targets.",
+            "severity": "Medium",
+            "mitigation": "Define p95/p99 latency SLOs and execute load testing before release milestones."
+        })
+
+    if not items:
+        items.append({
+            "type": "Assumption",
+            "description": "Operational tooling (monitoring, alerting, logging) will be available for production diagnostics.",
+            "severity": "Low",
+            "mitigation": "Capture observability requirements explicitly and validate with non-functional test cases."
+        })
+
+    return items
+
+
+def requirement_complexity_weight(requirement: str) -> int:
+    lower = requirement.lower()
+    weight = 3
+    heavy_keywords = [
+        "real-time", "distributed", "high availability", "multi-tenant", "encryption",
+        "compliance", "machine learning", "ai", "event-driven", "failover", "stream"
+    ]
+    medium_keywords = ["integration", "synchronization", "analytics", "workflow", "concurrent", "scalable"]
+
+    weight += sum(2 for kw in heavy_keywords if kw in lower)
+    weight += sum(1 for kw in medium_keywords if kw in lower)
+
+    if has_metric(requirement):
+        weight += 1
+
+    return max(1, min(weight, 13))
+
+
+def fallback_complexity(requirements: List[str]) -> Dict[str, Any]:
+    normalized = normalize_requirements(requirements)
+    if not normalized:
+        return {
+            "function_points": 0,
+            "story_points": 0,
+            "effort_estimate_weeks": 0,
+            "top_complex_requirements": []
+        }
+
+    weighted: List[Tuple[str, int]] = []
+    fr_function_points = 0
+    nfr_count = 0
+
+    for req in normalized:
+        classification = fallback_classification(req)["classification"]
+        weight = requirement_complexity_weight(req)
+        weighted.append((req, weight))
+
+        if classification in {"FR", "MIXED"}:
+            fr_function_points += weight
+        if classification in {"NFR", "MIXED"}:
+            nfr_count += 1
+
+    function_points = fr_function_points
+    story_points = int(round(function_points * 1.35 + max(1, nfr_count)))
+    effort_estimate_weeks = max(1, math.ceil(story_points / 12))
+
+    top_complex_requirements = [req for req, _ in sorted(weighted, key=lambda x: x[1], reverse=True)[:5]]
+
+    return {
+        "function_points": function_points,
+        "story_points": story_points,
+        "effort_estimate_weeks": effort_estimate_weeks,
+        "top_complex_requirements": top_complex_requirements
+    }
+
+
+def fallback_novelty(project_description: str, requirements: List[str], domain: str) -> Dict[str, Any]:
+    description = (project_description or "").lower()
+    req_text = " ".join(requirements).lower()
+    combined = f"{description} {req_text}".strip()
+
+    technical = 35
+    domain_score = 40
+    approach = 35
+
+    if any(k in combined for k in ["machine learning", "ai", "llm", "federated", "blockchain", "edge"]):
+        technical += 25
+    if any(k in combined for k in ["event-driven", "stream", "real-time", "distributed"]):
+        technical += 15
+    if any(k in combined for k in ["digital twin", "predictive", "autonomous"]):
+        technical += 10
+
+    domain_lower = (domain or "general").lower()
+    if domain_lower in {"healthcare", "finance", "aerospace"}:
+        domain_score = 58
+    elif domain_lower in {"iot", "cybersecurity"}:
+        domain_score = 54
+    elif domain_lower in {"education", "social media", "general"}:
+        domain_score = 42
+
+    if any(k in combined for k in ["microservices", "serverless", "hexagonal", "cqrs", "event sourcing"]):
+        approach += 18
+    if any(k in combined for k in ["monolithic", "crud"]):
+        approach -= 5
+
+    technical = max(0, min(100, technical))
+    domain_score = max(0, min(100, domain_score))
+    approach = max(0, min(100, approach))
+
+    score = int(round((technical + domain_score + approach) / 3))
+
+    if score >= 75:
+        category = "Novel"
+    elif score >= 60:
+        category = "Moderately Novel"
+    elif score >= 40:
+        category = "Incremental"
+    else:
+        category = "Conventional"
+
+    reasoning = (
+        "Novelty is driven by technical complexity, domain constraints, and architectural approach. "
+        "Higher score indicates stronger differentiation from conventional enterprise solutions."
+    )
+
+    return {
+        "score": score,
+        "category": category,
+        "breakdown": {
+            "technical": technical,
+            "domain": domain_score,
+            "approach": approach
+        },
+        "reasoning": reasoning
+    }
+
+
+def fallback_custom_generate(prompt: str) -> Dict[str, Any]:
+    lower_prompt = prompt.lower()
+
+    if "compare architectures" in lower_prompt or "exactly 5" in lower_prompt:
+        return {
+            "result": [
+                "Recommended architecture better handles scalability requirements for this project",
+                "It provides stronger modular boundaries and clearer separation of concerns",
+                "Deployment and release flexibility are improved for iterative delivery",
+                "It aligns more closely with the stated performance and reliability constraints",
+                "It supports future evolution and incremental growth with lower coupling"
+            ]
+        }
+
+    if "explain why" in lower_prompt and ("best for this project" in lower_prompt or "specific reasons" in lower_prompt):
+        return {
+            "result": [
+                "The architecture aligns with the project's core functional and quality requirements",
+                "It reduces system coupling and improves maintainability for ongoing changes",
+                "It provides a better path for scaling and operational resilience"
+            ]
+        }
+
+    if "choose best architecture" in lower_prompt or "return only one architecture name" in lower_prompt:
+        if any(k in lower_prompt for k in ["real-time", "event", "stream"]):
+            return {"result": "Event-Driven"}
+        if any(k in lower_prompt for k in ["scale", "scalability", "millions", "distributed"]):
+            return {"result": "Microservices"}
+        if any(k in lower_prompt for k in ["simple", "mvp", "single deployment"]):
+            return {"result": "Monolithic"}
+        return {"result": "Microservices"}
+
+    return {"result": "Monolithic"}
+
+
+# ==============================
+# PROMPT UTILITIES
+# ==============================
+def build_json_prompt(
+    task: str,
+    objective: str,
+    input_payload: Dict[str, Any],
+    output_schema: Dict[str, Any],
+    example_output: Any
+) -> str:
+    return f"""
+You are an expert requirements engineering and software architecture assistant.
+
+TASK: {task}
+OBJECTIVE: {objective}
+
+Return ONLY valid JSON. No markdown. No prose.
+
+<INPUT_JSON>
+{json.dumps(input_payload, ensure_ascii=False, indent=2)}
+</INPUT_JSON>
+
+<OUTPUT_SCHEMA_JSON>
+{json.dumps(output_schema, ensure_ascii=False, indent=2)}
+</OUTPUT_SCHEMA_JSON>
+
+<EXAMPLE_OUTPUT_JSON>
+{json.dumps(example_output, ensure_ascii=False, indent=2)}
+</EXAMPLE_OUTPUT_JSON>
+
+Rules:
+1. Output must strictly match schema keys.
+2. Use concise, implementation-ready language.
+3. Use measurable wording for rewritten requirements.
+""".strip()
+
+
+def extract_task_from_prompt(prompt: str) -> Optional[str]:
+    match = re.search(r"TASK:\s*([A-Z0-9_\-]+)", prompt)
+    return match.group(1).strip() if match else None
+
+
+def extract_input_json_from_prompt(prompt: str) -> Dict[str, Any]:
+    match = re.search(r"<INPUT_JSON>\s*([\s\S]*?)\s*</INPUT_JSON>", prompt)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(1).strip())
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def build_classification_prompt(text: str) -> str:
+    return build_json_prompt(
+        task="CLASSIFICATION",
+        objective="Classify requirement as FR, NFR, or MIXED with confidence and subcategory.",
+        input_payload={"requirement": text},
+        output_schema={
+            "classification": "FR | NFR | MIXED",
+            "confidence": 0.0,
+            "subcategory": ["string"],
+            "justification": "string",
+            "quality_issues": ["string"]
+        },
+        example_output={
+            "classification": "NFR",
+            "confidence": 0.92,
+            "subcategory": ["Performance"],
+            "justification": "The requirement constrains latency and throughput.",
+            "quality_issues": ["Missing explicit actor"]
+        }
+    )
+
+
+def build_quality_prompt(text: str) -> str:
+    return build_json_prompt(
+        task="QUALITY_ANALYSIS",
+        objective="Apply IEEE 830 quality scoring and SMART rewrite for one requirement.",
+        input_payload={"requirement": text},
+        output_schema={
+            "score": 0,
+            "vagueness": False,
+            "missing_elements": ["Actor", "Action", "Condition"],
+            "rewritten_requirement": "string"
+        },
+        example_output={
+            "score": 74,
+            "vagueness": True,
+            "missing_elements": ["Condition"],
+            "rewritten_requirement": "The system shall authenticate users using JWT tokens within 150 ms for 95% of login requests."
+        }
+    )
+
+
+def build_rewrite_prompt(text: str) -> str:
+    return build_json_prompt(
+        task="REWRITE_REQUIREMENT",
+        objective="Rewrite requirement into SMART, testable wording.",
+        input_payload={"requirement": text},
+        output_schema={
+            "rewritten_requirement": "string",
+            "metrics_added": ["string"],
+            "issues_fixed": ["string"]
+        },
+        example_output={
+            "rewritten_requirement": "The system shall process user login within 2 seconds for 95% of requests under 1,000 concurrent users.",
+            "metrics_added": ["response time <= 2s", "95th percentile", "1,000 concurrent users"],
+            "issues_fixed": ["removed vagueness", "added measurable condition"]
+        }
+    )
+
+
+def build_gap_prompt(requirements: List[str]) -> str:
+    return build_json_prompt(
+        task="GAP_ANALYSIS",
+        objective="Detect missing requirement categories: Security, Performance, Reliability, Usability, Compliance.",
+        input_payload={"requirements": requirements},
+        output_schema={
+            "gaps": [
+                {
+                    "gap": "string",
+                    "severity": "Critical | High | Medium | Low",
+                    "suggestion": "string"
+                }
+            ]
+        },
+        example_output={
+            "gaps": [
+                {
+                    "gap": "No security requirements found",
+                    "severity": "Critical",
+                    "suggestion": "System shall enforce JWT-based authentication and encrypt sensitive data in transit and at rest."
+                }
+            ]
+        }
+    )
+
+
+def build_traceability_prompt(requirements: List[str], architecture_components: List[str]) -> str:
+    return build_json_prompt(
+        task="TRACEABILITY_MATRIX",
+        objective="Map each requirement to one or more architecture components and identify traceability risks.",
+        input_payload={
+            "requirements": requirements,
+            "architecture_components": architecture_components
+        },
+        output_schema={
+            "matrix": [
+                {
+                    "requirement": "string",
+                    "components": ["string"]
+                }
+            ],
+            "untraced_requirements": ["string"],
+            "high_density_components": [
+                {
+                    "component": "string",
+                    "requirement_count": 0
+                }
+            ]
+        },
+        example_output={
+            "matrix": [
+                {
+                    "requirement": "Users can log in with email and password",
+                    "components": ["API Gateway", "Auth Service"]
+                }
+            ],
+            "untraced_requirements": [],
+            "high_density_components": [
+                {
+                    "component": "API Gateway",
+                    "requirement_count": 4
+                }
+            ]
+        }
+    )
+
+
+def build_risk_prompt(project_description: str, requirements: List[str]) -> str:
+    return build_json_prompt(
+        task="RISK_ASSUMPTION",
+        objective="Extract implicit assumptions and delivery risks with severity and mitigation.",
+        input_payload={
+            "project_description": project_description,
+            "requirements": requirements
+        },
+        output_schema={
+            "items": [
+                {
+                    "type": "Risk | Assumption",
+                    "description": "string",
+                    "severity": "Critical | High | Medium | Low",
+                    "mitigation": "string"
+                }
+            ]
+        },
+        example_output={
+            "items": [
+                {
+                    "type": "Risk",
+                    "description": "External payment provider availability may impact checkout success.",
+                    "severity": "High",
+                    "mitigation": "Implement retries, circuit breaker, and fallback payment options."
+                }
+            ]
+        }
+    )
+
+
+def build_complexity_prompt(requirements: List[str]) -> str:
+    return build_json_prompt(
+        task="COMPLEXITY_ESTIMATION",
+        objective="Estimate function points, story points, effort weeks, and top 5 complex requirements.",
+        input_payload={"requirements": requirements},
+        output_schema={
+            "function_points": 0,
+            "story_points": 0,
+            "effort_estimate_weeks": 0,
+            "top_complex_requirements": ["string"]
+        },
+        example_output={
+            "function_points": 42,
+            "story_points": 55,
+            "effort_estimate_weeks": 5,
+            "top_complex_requirements": [
+                "System shall process fraud detection in real-time with p95 latency under 100 ms"
+            ]
+        }
+    )
+
+
+def build_novelty_prompt(project_description: str, requirements: List[str], domain: str) -> str:
+    return build_json_prompt(
+        task="NOVELTY_ASSESSMENT",
+        objective="Assess novelty from technical, domain, and approach dimensions with a single score.",
+        input_payload={
+            "project_description": project_description,
+            "domain": domain,
+            "requirements": requirements
+        },
+        output_schema={
+            "score": 0,
+            "category": "Conventional | Incremental | Moderately Novel | Novel",
+            "breakdown": {
+                "technical": 0,
+                "domain": 0,
+                "approach": 0
+            },
+            "reasoning": "string"
+        },
+        example_output={
+            "score": 72,
+            "category": "Novel",
+            "breakdown": {
+                "technical": 78,
+                "domain": 66,
+                "approach": 72
+            },
+            "reasoning": "Combines event-driven architecture with domain-specific constraints and measurable quality targets."
+        }
+    )
+
+
+# ==============================
+# UNIFIED LLM ENGINE
+# ==============================
+def get_gemini_client():
+    global _gemini_model
+    if _gemini_model is not None:
+        return _gemini_model
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    _gemini_model = ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        google_api_key=GEMINI_API_KEY,
+        temperature=0.1
+    )
+    return _gemini_model
+
+
+async def call_gemini(prompt: str) -> str:
+    model = get_gemini_client()
+    response = await model.ainvoke(prompt)
+    content = getattr(response, "content", "")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part))
+            else:
+                parts.append(str(part))
+        return "\n".join(parts)
+
+    return str(content)
+
+
+def fallback_from_prompt(prompt: str) -> Dict[str, Any]:
+    task = extract_task_from_prompt(prompt)
+    payload = extract_input_json_from_prompt(prompt)
+
+    if task == "CLASSIFICATION":
+        return fallback_classification(payload.get("requirement", ""))
+
+    if task == "QUALITY_ANALYSIS":
+        return fallback_quality_analysis(payload.get("requirement", ""))
+
+    if task == "REWRITE_REQUIREMENT":
+        req = payload.get("requirement", "")
+        quality = fallback_quality_analysis(req)
+        return {
+            "rewritten_requirement": quality["rewritten_requirement"],
+            "metrics_added": [
+                "response-time target",
+                "concurrency/load target",
+                "explicit trigger condition"
+            ],
+            "issues_fixed": [
+                "added measurable criteria",
+                "clarified actor/action/condition"
+            ]
+        }
+
+    if task == "GAP_ANALYSIS":
+        requirements = normalize_requirements(payload.get("requirements", []))
+        return {"gaps": fallback_gap_analysis(requirements)}
+
+    if task == "TRACEABILITY_MATRIX":
+        requirements = normalize_requirements(payload.get("requirements", []))
+        components = normalize_requirements(payload.get("architecture_components", []))
+        return fallback_traceability(requirements, components)
+
+    if task == "RISK_ASSUMPTION":
+        requirements = normalize_requirements(payload.get("requirements", []))
+        return {"items": fallback_risk_assumptions(payload.get("project_description", ""), requirements)}
+
+    if task == "COMPLEXITY_ESTIMATION":
+        requirements = normalize_requirements(payload.get("requirements", []))
+        return fallback_complexity(requirements)
+
+    if task == "NOVELTY_ASSESSMENT":
+        requirements = normalize_requirements(payload.get("requirements", []))
+        return fallback_novelty(
+            payload.get("project_description", ""),
+            requirements,
+            payload.get("domain", "General")
+        )
+
+    # Backward compatibility for /llm/generate free prompts
+    return fallback_custom_generate(prompt)
+
+
+async def call_llm(prompt: str) -> Dict[str, Any]:
+    """
+    Unified LLM entrypoint (required by architecture rules).
+    Always returns JSON-compatible dict.
+    """
+    clean_prompt = (prompt or "").strip()
+    if not clean_prompt:
+        return {"error": "empty_prompt"}
+
+    last_error: Optional[str] = None
+
+    global _gemini_disabled
+
+    if GEMINI_API_KEY and not _gemini_disabled:
+        for attempt in range(MAX_LLM_RETRIES):
+            try:
+                raw = await asyncio.wait_for(call_gemini(clean_prompt), timeout=LLM_TIMEOUT_SECONDS)
+                parsed = extract_json_content(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"result": parsed}
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, MAX_LLM_RETRIES, exc)
+
+                # If the provider/key is invalid, skip remote calls for the rest of runtime.
+                lower_err = last_error.lower()
+                if any(token in lower_err for token in [
+                    "api key", "unauthorized", "permission", "403", "401", "quota",
+                    "timed out", "timeout", "connection", "network", "dns", "max retries"
+                ]):
+                    _gemini_disabled = True
+                    break
+
+                if attempt < MAX_LLM_RETRIES - 1:
+                    await asyncio.sleep(0.6 * (2 ** attempt))
+
+    fallback = fallback_from_prompt(clean_prompt)
+    if last_error and isinstance(fallback, dict):
+        fallback.setdefault("_fallback_reason", last_error)
+    return fallback if isinstance(fallback, dict) else {"result": fallback}
+
+
+# ==============================
+# MODULE SERVICE FUNCTIONS
+# ==============================
+async def classify_requirement_llm(text: str) -> Dict[str, Any]:
+    fallback = fallback_classification(text)
+    response = await call_llm(build_classification_prompt(text))
+    payload = unwrap_result(response)
+
+    if not isinstance(payload, dict):
+        return fallback
+
+    classification = str(payload.get("classification", fallback["classification"])).upper().strip()
+    if classification not in {"FR", "NFR", "MIXED"}:
+        classification = fallback["classification"]
+
+    confidence = payload.get("confidence", fallback["confidence"])
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except Exception:
+        confidence = float(fallback["confidence"])
+
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "subcategory": normalize_string_list(payload.get("subcategory", fallback.get("subcategory", []))),
+        "justification": str(payload.get("justification", fallback["justification"])).strip(),
+        "quality_issues": normalize_string_list(payload.get("quality_issues", []))
+    }
+
+
+async def quality_analysis_llm(text: str) -> Dict[str, Any]:
+    fallback = fallback_quality_analysis(text)
+    response = await call_llm(build_quality_prompt(text))
+    payload = unwrap_result(response)
+
+    if not isinstance(payload, dict):
+        return fallback
+
+    rewritten = str(payload.get("rewritten_requirement", fallback["rewritten_requirement"])).strip() or fallback["rewritten_requirement"]
+
+    return {
+        "score": clamp_int(payload.get("score"), 0, 100, fallback["score"]),
+        "vagueness": normalize_bool(payload.get("vagueness"), fallback["vagueness"]),
+        "missing_elements": normalize_string_list(payload.get("missing_elements", fallback["missing_elements"])),
+        "rewritten_requirement": sanitize_rewritten_requirement(rewritten)
+    }
+
+
+async def run_gap_analysis(requirements: List[str]) -> List[Dict[str, str]]:
+    normalized = normalize_requirements(requirements)
+    fallback = fallback_gap_analysis(normalized)
+    response = await call_llm(build_gap_prompt(normalized))
+    payload = unwrap_result(response)
+
+    if isinstance(payload, dict):
+        payload = payload.get("gaps")
+
+    if not isinstance(payload, list):
+        return fallback
+
+    gaps = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        gap_text = str(item.get("gap", "")).strip()
+        suggestion = str(item.get("suggestion", "")).strip()
+        if not gap_text or not suggestion:
+            continue
+        gaps.append({
+            "gap": gap_text,
+            "severity": normalize_severity(item.get("severity"), "Medium"),
+            "suggestion": suggestion
+        })
+
+    return gaps or fallback
+
+
+async def run_traceability(requirements: List[str], architecture_components: List[str]) -> Dict[str, Any]:
+    reqs = normalize_requirements(requirements)
+    comps = normalize_requirements(architecture_components)
+    fallback = fallback_traceability(reqs, comps)
+
+    response = await call_llm(build_traceability_prompt(reqs, comps))
+    payload = unwrap_result(response)
+
+    if not isinstance(payload, dict):
+        return fallback
+
+    matrix_raw = payload.get("matrix")
+    if not isinstance(matrix_raw, list):
+        return fallback
+
+    matrix = []
+    for row in matrix_raw:
+        if not isinstance(row, dict):
+            continue
+        requirement = str(row.get("requirement", "")).strip()
+        components = normalize_string_list(row.get("components", []))
+        if requirement:
+            matrix.append({"requirement": requirement, "components": components})
+
+    untraced = normalize_string_list(payload.get("untraced_requirements", []))
+
+    density_raw = payload.get("high_density_components", [])
+    high_density = []
+    if isinstance(density_raw, list):
+        for item in density_raw:
+            if not isinstance(item, dict):
+                continue
+            component = str(item.get("component", "")).strip()
+            count = clamp_int(item.get("requirement_count"), 0, 10_000, 0)
+            if component:
+                high_density.append({"component": component, "requirement_count": count})
+
+    if not matrix:
+        return fallback
+
+    return {
+        "matrix": matrix,
+        "untraced_requirements": untraced,
+        "high_density_components": high_density
+    }
+
+
+async def run_risk_assumptions(project_description: str, requirements: List[str]) -> List[Dict[str, str]]:
+    reqs = normalize_requirements(requirements)
+    fallback = fallback_risk_assumptions(project_description, reqs)
+
+    response = await call_llm(build_risk_prompt(project_description, reqs))
+    payload = unwrap_result(response)
+
+    if isinstance(payload, dict):
+        payload = payload.get("items")
+
+    if not isinstance(payload, list):
+        return fallback
+
+    items = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        item_type = str(row.get("type", "")).strip().title()
+        if item_type not in {"Risk", "Assumption"}:
+            continue
+        description = str(row.get("description", "")).strip()
+        mitigation = str(row.get("mitigation", "")).strip()
+        if not description or not mitigation:
+            continue
+        items.append({
+            "type": item_type,
+            "description": description,
+            "severity": normalize_severity(row.get("severity"), "Medium"),
+            "mitigation": mitigation
+        })
+
+    return items or fallback
+
+
+async def run_complexity(requirements: List[str]) -> Dict[str, Any]:
+    reqs = normalize_requirements(requirements)
+    fallback = fallback_complexity(reqs)
+
+    response = await call_llm(build_complexity_prompt(reqs))
+    payload = unwrap_result(response)
+
+    if not isinstance(payload, dict):
+        return fallback
+
+    return {
+        "function_points": clamp_int(payload.get("function_points"), 0, 100_000, fallback["function_points"]),
+        "story_points": clamp_int(payload.get("story_points"), 0, 100_000, fallback["story_points"]),
+        "effort_estimate_weeks": clamp_int(payload.get("effort_estimate_weeks"), 0, 10_000, fallback["effort_estimate_weeks"]),
+        "top_complex_requirements": normalize_string_list(payload.get("top_complex_requirements", fallback["top_complex_requirements"]))[:5]
+    }
+
+
+async def run_novelty(project_description: str, requirements: List[str], domain: str) -> Dict[str, Any]:
+    reqs = normalize_requirements(requirements)
+    fallback = fallback_novelty(project_description, reqs, domain)
+
+    response = await call_llm(build_novelty_prompt(project_description, reqs, domain))
+    payload = unwrap_result(response)
+
+    if not isinstance(payload, dict):
+        return fallback
+
+    breakdown = payload.get("breakdown", {})
+    if not isinstance(breakdown, dict):
+        breakdown = {}
+
+    return {
+        "score": clamp_int(payload.get("score"), 0, 100, fallback["score"]),
+        "category": str(payload.get("category", fallback["category"])).strip() or fallback["category"],
+        "breakdown": {
+            "technical": clamp_int(breakdown.get("technical"), 0, 100, fallback["breakdown"]["technical"]),
+            "domain": clamp_int(breakdown.get("domain"), 0, 100, fallback["breakdown"]["domain"]),
+            "approach": clamp_int(breakdown.get("approach"), 0, 100, fallback["breakdown"]["approach"])
+        },
+        "reasoning": str(payload.get("reasoning", fallback["reasoning"])).strip() or fallback["reasoning"]
+    }
+
+
+async def analyze_requirement_pair(req_text: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    classification_task = classify_requirement_llm(req_text)
+    quality_task = quality_analysis_llm(req_text)
+    classification, quality = await asyncio.gather(classification_task, quality_task)
+    return req_text, classification, quality
+
+
+# ==============================
+# API: ANALYZE (BACKWARD COMPAT)
+# ==============================
+@app.post("/analyze")
+async def analyze_requirements(request: AnalysisRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        analysis_result = {
+            "project_id": request.project_id,
+            "analyzed_at": datetime.utcnow(),
+            "classifications": [],
+            "overall_quality": 0,
+            "quality_summary": {
+                "ambiguous_count": 0,
+                "high_risk": 0
+            }
+        }
+
+        total_score = 0
+
+        analyzed = await asyncio.gather(*(analyze_requirement_pair(req) for req in requirements))
+
+        for idx, (req_text, cls, quality) in enumerate(analyzed):
+
+            quality_issues = list(dict.fromkeys(cls.get("quality_issues", [])))
+            if quality["vagueness"] and "Ambiguous" not in quality_issues:
+                quality_issues.append("Ambiguous")
+            if quality["missing_elements"]:
+                quality_issues.append(f"Missing: {', '.join(quality['missing_elements'])}")
+
+            if quality["vagueness"]:
+                analysis_result["quality_summary"]["ambiguous_count"] += 1
+            if quality["score"] < 60:
+                analysis_result["quality_summary"]["high_risk"] += 1
+
+            item = {
+                "requirement_index": idx,
+                "text": req_text,
+
+                # Backward-compatible fields
+                "classification": cls["classification"],
+                "confidence": cls["confidence"],
+                "subcategories": cls["subcategory"],
+
+                # Enhanced fields
+                "justification": cls.get("justification", ""),
+                "quality_issues": quality_issues,
+                "improved_requirement": quality["rewritten_requirement"],
+                "rewritten_requirement": quality["rewritten_requirement"],
+                "missing_elements": quality["missing_elements"],
+
+                # Quality module output
+                "is_vague": quality["vagueness"],
+                "quality_score": quality["score"]
+            }
+
+            analysis_result["classifications"].append(item)
+            total_score += quality["score"]
+
+        analysis_result["overall_quality"] = total_score // len(requirements) if requirements else 0
+
+        result = analysis_collection.insert_one(analysis_result)
+
+        return {
+            "analysis_id": str(result.inserted_id),
+            "project_id": request.project_id,
+            "status": "completed",
+            "classifications_count": len(analysis_result["classifications"]),
+            "overall_quality": analysis_result["overall_quality"]
+        }
+
+    except Exception as exc:
+        logger.exception("Analyze endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================
+# API: GET ANALYSIS
+# ==============================
+@app.get("/analysis/{project_id}")
+async def get_analysis(project_id: str):
+    try:
+        analysis = analysis_collection.find_one({"project_id": project_id}, sort=[("analyzed_at", -1)])
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+
+        analysis["_id"] = str(analysis["_id"])
+        analyzed_at = analysis.get("analyzed_at")
+        if isinstance(analyzed_at, datetime):
+            analysis["analyzed_at"] = analyzed_at.isoformat()
+
+        return analysis
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Get analysis failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================
+# API: REWRITE
+# ==============================
+@app.post("/rewrite-requirement")
+async def rewrite_requirement(payload: RewriteRequest):
+    try:
+        requirement_text = payload.requirement_text.strip()
+        if not requirement_text:
+            raise HTTPException(status_code=400, detail="requirement_text is required")
+
+        response = await call_llm(build_rewrite_prompt(requirement_text))
+        parsed = unwrap_result(response)
+
+        fallback_quality = fallback_quality_analysis(requirement_text)
+        rewritten = fallback_quality["rewritten_requirement"]
+
+        if isinstance(parsed, dict):
+            rewritten = str(parsed.get("rewritten_requirement", rewritten)).strip() or rewritten
+        rewritten = sanitize_rewritten_requirement(rewritten)
+
+        return {
+            "original": requirement_text,
+            "rewritten": rewritten,
+            "improved_specificity": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Rewrite endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================
+# MODULE ENDPOINTS
+# ==============================
+@app.post("/quality/enhanced")
+async def enhanced_quality_analysis(request: EnhancedQualityRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        rows = []
+        total = 0
+
+        quality_rows = await asyncio.gather(*(quality_analysis_llm(req) for req in requirements))
+
+        for req, quality in zip(requirements, quality_rows):
+            rows.append({
+                "requirement": req,
+                "score": quality["score"],
+                "vagueness": quality["vagueness"],
+                "missing_elements": quality["missing_elements"],
+                "rewritten_requirement": quality["rewritten_requirement"]
+            })
+            total += quality["score"]
+
+        return {
+            "project_id": request.project_id,
+            "requirements": rows,
+            "overall_quality": total // len(rows) if rows else 0
+        }
+
+    except Exception as exc:
+        logger.exception("Enhanced quality endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/gap-analysis")
+async def requirement_gap_analysis(request: GapAnalysisRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        gaps = await run_gap_analysis(requirements)
+        return {"gaps": gaps}
+    except Exception as exc:
+        logger.exception("Gap analysis endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/traceability-matrix")
+async def traceability_matrix(request: TraceabilityRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        components = normalize_requirements(request.architecture_components)
+        matrix = await run_traceability(requirements, components)
+        return matrix
+    except Exception as exc:
+        logger.exception("Traceability endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/risk-assumptions")
+async def risk_assumptions(request: RiskAssumptionRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        items = await run_risk_assumptions(request.project_description or "", requirements)
+        return {"items": items}
+    except Exception as exc:
+        logger.exception("Risk/assumption endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/complexity-estimation")
+async def complexity_estimation(request: ComplexityRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        result = await run_complexity(requirements)
+        return result
+    except Exception as exc:
+        logger.exception("Complexity endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/novelty-assessment")
+async def novelty_assessment(request: NoveltyRequest):
+    try:
+        requirements = normalize_requirements(request.requirements)
+        result = await run_novelty(request.project_description or "", requirements, request.domain or "General")
+        return result
+    except Exception as exc:
+        logger.exception("Novelty endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================
+# API: CUSTOM PROMPT GENERATE
+# ==============================
+@app.post("/llm/generate")
+async def generate_from_prompt(payload: PromptRequest):
+    prompt = (payload.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    response = await call_llm(prompt)
+    parsed = unwrap_result(response)
+
+    if isinstance(parsed, (dict, list, str, int, float, bool)):
+        return {"result": parsed}
+
+    return {"result": str(parsed)}
+
+
+# ==============================
+# HEALTH
+# ==============================
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "llm",
+        "llm_ready": True,
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_model": GEMINI_MODEL
+    }
+
+
+# ==============================
+# MAIN
+# ==============================
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8002)

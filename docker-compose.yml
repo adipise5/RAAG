@@ -1,0 +1,230 @@
+version: '3.8'
+
+services:
+  # Databases
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - raag-network
+
+  postgres:
+    image: postgres:15
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: raag
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - raag-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - raag-network
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - raag-network
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+      - redis
+      - rabbitmq
+    environment:
+      NODE_ENV: development
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    networks:
+      - raag-network
+
+  # User & Project Management
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    ports:
+      - "8008:8008"
+    depends_on:
+      - mongodb
+    environment:
+      PORT: 8008
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+      DB_NAME: raag_users
+    networks:
+      - raag-network
+
+  # Requirement Ingestion
+  ingestion-service:
+    build:
+      context: ./services/ingestion-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    depends_on:
+      - mongodb
+      - rabbitmq
+    environment:
+      PORT: 8001
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    networks:
+      - raag-network
+
+  # LLM Analysis
+  llm-service:
+    build:
+      context: ./services/llm-service
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    depends_on:
+      - mongodb
+      - rabbitmq
+    environment:
+      PORT: 8002
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-placeholder}
+    networks:
+      - raag-network
+
+  # Quality Validator
+  quality-service:
+    build:
+      context: ./services/quality-service
+      dockerfile: Dockerfile
+    ports:
+      - "8004:8004"
+    depends_on:
+      - postgres
+    environment:
+      PORT: 8004
+      DB_HOST: postgres
+      DB_USER: admin
+      DB_PASSWORD: password
+      DB_NAME: raag
+    networks:
+      - raag-network
+
+  # Architecture Generator
+  architecture-service:
+    build:
+      context: ./services/architecture-service
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    depends_on:
+      - mongodb
+      - llm-service
+    environment:
+      PORT: 8003
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+      LLM_SERVICE_URL: http://llm-service:8002
+    networks:
+      - raag-network
+
+  # Audit Trail
+  audit-service:
+    build:
+      context: ./services/audit-service
+      dockerfile: Dockerfile
+    ports:
+      - "8005:8005"
+    depends_on:
+      - postgres
+      - rabbitmq
+    environment:
+      PORT: 8005
+      DB_HOST: postgres
+      DB_USER: admin
+      DB_PASSWORD: password
+      DB_NAME: raag
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    networks:
+      - raag-network
+
+  # Export Service
+  export-service:
+    build:
+      context: ./services/export-service
+      dockerfile: Dockerfile
+    ports:
+      - "8006:8006"
+    depends_on:
+      - mongodb
+    environment:
+      PORT: 8006
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+    networks:
+      - raag-network
+
+  # Chatbot Service
+  chatbot-service:
+    build:
+      context: ./services/chatbot-service
+      dockerfile: Dockerfile
+    ports:
+      - "8007:8007"
+    depends_on:
+      - mongodb
+      - redis
+    environment:
+      PORT: 8007
+      NODE_ENV: development
+      MONGO_URL: mongodb://admin:password@mongodb:27017
+      REDIS_URL: redis://redis:6379
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-placeholder}
+    networks:
+      - raag-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api-gateway
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    networks:
+      - raag-network
+
+volumes:
+  mongo_data:
+  postgres_data:
+  rabbitmq_data:
+
+networks:
+  raag-network:
+    driver: bridge

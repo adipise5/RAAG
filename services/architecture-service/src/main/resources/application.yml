@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: architecture-service
+  data:
+    mongodb:
+      uri: mongodb://admin:password@mongodb:27017/raag_architecture?authSource=admin
+  jpa:
+    hibernate:
+      ddl-auto: update
+
+server:
+  port: 8003
+  servlet:
+    context-path: /
+
+logging:
+  level:
+    root: INFO
+
+llm:
+  service:
+    url: ${LLM_SERVICE_URL:http://llm-service:8002}
