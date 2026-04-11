@@ -21,10 +21,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 MAX_LLM_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "8"))
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
 
 mongo_client = MongoClient(MONGO_URL)
 db = mongo_client["raag_projects"]
 analysis_collection = db["analysis"]
+projects_collection = db["projects"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("raag-llm")
@@ -110,6 +114,8 @@ RISK_SEVERITY = {"low": "Low", "medium": "Medium", "high": "High", "critical": "
 
 _gemini_model = None
 _gemini_disabled = False
+_ollama_ready = False  # set to True after model is confirmed available
+_ollama_semaphore: Optional[asyncio.Semaphore] = None  # limits concurrent Ollama calls
 
 
 # ==============================
@@ -668,31 +674,20 @@ def build_json_prompt(
     output_schema: Dict[str, Any],
     example_output: Any
 ) -> str:
-    return f"""
-You are an expert requirements engineering and software architecture assistant.
-
-TASK: {task}
-OBJECTIVE: {objective}
-
-Return ONLY valid JSON. No markdown. No prose.
-
-<INPUT_JSON>
-{json.dumps(input_payload, ensure_ascii=False, indent=2)}
-</INPUT_JSON>
-
-<OUTPUT_SCHEMA_JSON>
-{json.dumps(output_schema, ensure_ascii=False, indent=2)}
-</OUTPUT_SCHEMA_JSON>
-
-<EXAMPLE_OUTPUT_JSON>
-{json.dumps(example_output, ensure_ascii=False, indent=2)}
-</EXAMPLE_OUTPUT_JSON>
-
-Rules:
-1. Output must strictly match schema keys.
-2. Use concise, implementation-ready language.
-3. Use measurable wording for rewritten requirements.
-""".strip()
+    """
+    Compact prompt template.  Keeps <INPUT_JSON> tags so fallback_from_prompt
+    can still extract the inputs if both LLMs fail.
+    Schema and example are inlined (no indentation) to minimise token count.
+    """
+    return (
+        f"You are an expert requirements engineering and software architecture assistant.\n"
+        f"TASK: {task}\n"
+        f"Objective: {objective}\n"
+        f"Return ONLY valid JSON. No markdown. No prose.\n\n"
+        f"<INPUT_JSON>{json.dumps(input_payload, ensure_ascii=False)}</INPUT_JSON>\n\n"
+        f"Schema: {json.dumps(output_schema, ensure_ascii=False)}\n"
+        f"Example: {json.dumps(example_output, ensure_ascii=False)}"
+    )
 
 
 def extract_task_from_prompt(prompt: str) -> Optional[str]:
@@ -923,6 +918,49 @@ def build_novelty_prompt(project_description: str, requirements: List[str], doma
     )
 
 
+def build_combined_analysis_prompt(text: str) -> str:
+    """
+    Single-shot prompt that returns BOTH classification AND quality analysis for
+    one requirement.  Cuts LLM calls per requirement from 2 → 1.
+    Kept deliberately concise to reduce Ollama prefill latency.
+    """
+    schema = {
+        "classification": "FR|NFR|MIXED",
+        "confidence": 0.95,
+        "subcategory": ["Security"],
+        "justification": "one sentence",
+        "quality_issues": ["string"],
+        "score": 85,
+        "vagueness": False,
+        "missing_elements": [],
+        "rewritten_requirement": "The system shall ... within <metric>.",
+        "priority": "High|Medium|Low",
+        "entities": ["string"],
+        "processes": ["string"],
+        "data_stores": ["string"]
+    }
+    return (
+        "You are a requirements engineering expert. Analyze this software requirement in one pass "
+        "and return ONLY valid JSON — no markdown, no prose.\n\n"
+        f"Requirement: {json.dumps(text)}\n\n"
+        f"Return JSON matching exactly: {json.dumps(schema, ensure_ascii=False)}\n\n"
+        "Rules:\n"
+        "- classification: FR (functional — user actions, data processing, business logic), "
+        "NFR (non-functional — performance, security, usability, reliability), or MIXED.\n"
+        "- subcategory: pick from [Security, Performance, Reliability, Usability, Compliance, "
+        "Data Management, Authentication, Integration, UI/UX, Business Logic, Reporting].\n"
+        "- score: 0-100 using IEEE 830 criteria (unambiguous, testable, complete, consistent, traceable). "
+        "Deduct for vague terms (fast, easy, etc), missing actor/action/condition, no measurable metric.\n"
+        "- vagueness: true if requirement uses vague terms like fast, easy, simple, robust, seamless, efficient.\n"
+        "- missing_elements: list from [Actor, Action, Condition, Metric] that are absent.\n"
+        "- rewritten_requirement: SMART rewrite — specific actor, measurable criteria, testable condition.\n"
+        "- priority: High (security, core business, data integrity), Medium (usability, reporting), Low (nice-to-have).\n"
+        "- entities: external actors or systems mentioned (e.g., User, Admin, Payment Gateway).\n"
+        "- processes: verbs/actions described (e.g., authenticate, generate report, encrypt data).\n"
+        "- data_stores: data repositories implied (e.g., User Database, Audit Log, Session Store)."
+    )
+
+
 # ==============================
 # UNIFIED LLM ENGINE
 # ==============================
@@ -959,6 +997,90 @@ async def call_gemini(prompt: str) -> str:
         return "\n".join(parts)
 
     return str(content)
+
+
+# ==============================
+# OLLAMA LOCAL LLM (fallback)
+# ==============================
+async def _pull_ollama_model_bg():
+    """Pull the Ollama model in the background. Retries until Ollama is reachable."""
+    global _ollama_ready
+    import httpx
+    delay = 10
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                ping = await client.get(f"{OLLAMA_URL}/api/tags")
+                if ping.status_code != 200:
+                    raise RuntimeError(f"Ollama ping returned {ping.status_code}")
+
+                tags = ping.json().get("models", [])
+                already_pulled = any(
+                    m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0])
+                    for m in tags
+                )
+                if already_pulled:
+                    logger.info("Ollama model '%s' already available.", OLLAMA_MODEL)
+                    _ollama_ready = True
+                    return
+
+            logger.info("Pulling Ollama model '%s' — this may take a few minutes...", OLLAMA_MODEL)
+            async with httpx.AsyncClient(timeout=3600) as client:
+                async with client.stream(
+                    "POST",
+                    f"{OLLAMA_URL}/api/pull",
+                    json={"name": OLLAMA_MODEL},
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if '"status":"success"' in line:
+                            break
+            _ollama_ready = True
+            logger.info("Ollama model '%s' ready.", OLLAMA_MODEL)
+            return
+        except Exception as exc:
+            logger.warning("Ollama not yet reachable (attempt %d): %s — retrying in %ds", attempt, exc, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120)  # cap at 2 min
+
+
+@app.on_event("startup")
+async def startup_event():
+    global _ollama_semaphore
+    # Allow at most 4 concurrent Ollama calls — prevents memory thrashing on 8 GB GPU
+    _ollama_semaphore = asyncio.Semaphore(4)
+    asyncio.create_task(_pull_ollama_model_bg())
+
+
+async def call_ollama(prompt: str) -> str:
+    """
+    Send a plain prompt to the local Ollama model and return the text response.
+    Uses the OpenAI-compatible /v1/chat/completions endpoint.
+    Concurrency is limited by _ollama_semaphore (≤4 simultaneous calls).
+    num_ctx=2048 and num_predict=512 cap memory use and prevent runaway generation.
+    """
+    import httpx
+    sem = _ollama_semaphore or asyncio.Semaphore(4)
+    async with sem:
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {
+                "temperature": 0.0,   # fully deterministic — faster + more consistent JSON
+                "num_ctx": 2048,      # our prompts fit in ~400 tokens; 2048 is generous
+                "num_predict": 512,   # all JSON responses fit in 512 tokens; prevents runaway
+            },
+        }
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/v1/chat/completions",
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
 
 
 def fallback_from_prompt(prompt: str) -> Dict[str, Any]:
@@ -1041,11 +1163,11 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
                 last_error = str(exc)
                 logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, MAX_LLM_RETRIES, exc)
 
-                # If the provider/key is invalid, skip remote calls for the rest of runtime.
+                # Only permanently disable for auth/key errors, not transient rate-limits.
                 lower_err = last_error.lower()
                 if any(token in lower_err for token in [
-                    "api key", "unauthorized", "permission", "403", "401", "quota",
-                    "timed out", "timeout", "connection", "network", "dns", "max retries"
+                    "api key", "unauthorized", "permission", "403", "401",
+                    "not found", "timed out", "timeout", "connection", "network", "dns", "max retries"
                 ]):
                     _gemini_disabled = True
                     break
@@ -1054,6 +1176,19 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
                     await asyncio.sleep(0.6 * (2 ** attempt))
 
     fallback = fallback_from_prompt(clean_prompt)
+
+    # --- Tier 2: local Ollama model (llama3.1:8b) ---
+    if _ollama_ready:
+        try:
+            raw = await asyncio.wait_for(call_ollama(clean_prompt), timeout=OLLAMA_TIMEOUT_SECONDS)
+            parsed = extract_json_content(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"result": parsed}
+        except Exception as exc:
+            logger.warning("Ollama call failed, using heuristic fallback: %s", exc)
+
+    # --- Tier 3: heuristic fallback ---
     if last_error and isinstance(fallback, dict):
         fallback.setdefault("_fallback_reason", last_error)
     return fallback if isinstance(fallback, dict) else {"result": fallback}
@@ -1261,11 +1396,185 @@ async def run_novelty(project_description: str, requirements: List[str], domain:
     }
 
 
+# ==============================
+# ENTITY / PROCESS / DATA STORE EXTRACTION (HEURISTIC FALLBACKS)
+# ==============================
+def fallback_priority(requirement: str, classification: str) -> str:
+    lower = requirement.lower()
+    if any(k in lower for k in ["security", "auth", "encrypt", "password", "token", "compliance", "gdpr", "hipaa"]):
+        return "High"
+    if any(k in lower for k in ["shall", "must", "critical", "real-time", "transaction", "data integrity"]):
+        return "High"
+    if classification == "NFR" and any(k in lower for k in ["performance", "availability", "reliability"]):
+        return "High"
+    if any(k in lower for k in ["report", "dashboard", "display", "view", "notification", "email"]):
+        return "Medium"
+    if any(k in lower for k in ["nice", "optional", "future", "may", "could", "color", "theme"]):
+        return "Low"
+    return "Medium"
+
+
+def fallback_extract_entities(requirement: str) -> List[str]:
+    lower = requirement.lower()
+    entities = []
+    entity_map = {
+        "admin": "Admin",
+        "administrator": "Administrator",
+        "user": "User",
+        "customer": "Customer",
+        "client": "Client",
+        "operator": "Operator",
+        "doctor": "Doctor",
+        "patient": "Patient",
+        "manager": "Manager",
+        "system": "System",
+        "service": "External Service",
+        "api": "External API",
+        "payment gateway": "Payment Gateway",
+        "third-party": "Third-Party Service",
+        "database": "Database",
+    }
+    for keyword, entity in entity_map.items():
+        if keyword in lower and entity not in entities:
+            entities.append(entity)
+    return entities or ["System"]
+
+
+def fallback_extract_processes(requirement: str) -> List[str]:
+    lower = requirement.lower()
+    process_keywords = [
+        "authenticate", "authorize", "login", "register", "create", "update", "delete",
+        "process", "generate", "send", "receive", "store", "retrieve", "validate",
+        "encrypt", "decrypt", "export", "import", "notify", "schedule", "monitor",
+        "analyze", "classify", "filter", "search", "sort", "calculate", "verify",
+        "upload", "download", "backup", "restore", "log", "audit", "synchronize"
+    ]
+    found = []
+    for proc in process_keywords:
+        if proc in lower:
+            found.append(proc.capitalize())
+    return found or ["Process"]
+
+
+def fallback_extract_data_stores(requirement: str) -> List[str]:
+    lower = requirement.lower()
+    stores = []
+    store_map = {
+        "user": "User Database",
+        "patient": "Patient Records",
+        "audit": "Audit Log",
+        "log": "System Logs",
+        "session": "Session Store",
+        "config": "Configuration Store",
+        "report": "Report Store",
+        "document": "Document Store",
+        "file": "File Storage",
+        "cache": "Cache Store",
+        "credential": "Credential Store",
+        "token": "Token Store",
+        "notification": "Notification Queue",
+        "event": "Event Store",
+        "transaction": "Transaction Log",
+    }
+    for keyword, store in store_map.items():
+        if keyword in lower and store not in stores:
+            stores.append(store)
+    return stores
+
+
 async def analyze_requirement_pair(req_text: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    classification_task = classify_requirement_llm(req_text)
-    quality_task = quality_analysis_llm(req_text)
-    classification, quality = await asyncio.gather(classification_task, quality_task)
-    return req_text, classification, quality
+    """
+    Run classification + quality analysis for one requirement.
+    Uses a single combined LLM call (2→1), halving the number of round-trips.
+    Falls back to separate heuristics if the LLM returns an unusable response.
+    """
+    cls_fallback = fallback_classification(req_text)
+    qual_fallback = fallback_quality_analysis(req_text)
+
+    combined_prompt = build_combined_analysis_prompt(req_text)
+
+    # Try Gemini first, then Ollama (same tier logic as call_llm but direct)
+    raw: Optional[str] = None
+    global _gemini_disabled
+    if GEMINI_API_KEY and not _gemini_disabled:
+        try:
+            raw = await asyncio.wait_for(call_gemini(combined_prompt), timeout=LLM_TIMEOUT_SECONDS)
+        except Exception as exc:
+            err_lower = str(exc).lower()
+            if any(t in err_lower for t in ["429", "quota", "resourceexhausted", "exceeded"]):
+                _gemini_disabled = True
+                logger.warning("Combined analysis: Gemini quota exhausted — disabling")
+            else:
+                logger.warning("Combined analysis: Gemini failed: %s", exc)
+
+    if raw is None and _ollama_ready:
+        try:
+            raw = await asyncio.wait_for(call_ollama(combined_prompt), timeout=OLLAMA_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.warning("Combined analysis: Ollama failed: %s", exc)
+
+    if raw is None:
+        qual_fallback["priority"] = fallback_priority(req_text, cls_fallback["classification"])
+        qual_fallback["entities"] = fallback_extract_entities(req_text)
+        qual_fallback["processes"] = fallback_extract_processes(req_text)
+        qual_fallback["data_stores"] = fallback_extract_data_stores(req_text)
+        return req_text, cls_fallback, qual_fallback
+
+    # Parse the single combined response
+    try:
+        payload = extract_json_content(raw)
+        payload = unwrap_result(payload) if isinstance(payload, dict) else payload
+        if not isinstance(payload, dict) or "classification" not in payload:
+            raise ValueError("Missing 'classification' key")
+    except Exception as exc:
+        logger.warning("Combined analysis: JSON parse failed (%s) — using heuristics", exc)
+        qual_fallback["priority"] = fallback_priority(req_text, cls_fallback["classification"])
+        qual_fallback["entities"] = fallback_extract_entities(req_text)
+        qual_fallback["processes"] = fallback_extract_processes(req_text)
+        qual_fallback["data_stores"] = fallback_extract_data_stores(req_text)
+        return req_text, cls_fallback, qual_fallback
+
+    # --- Build classification result ---
+    classification = str(payload.get("classification", cls_fallback["classification"])).upper().strip()
+    if classification not in {"FR", "NFR", "MIXED"}:
+        classification = cls_fallback["classification"]
+
+    confidence = payload.get("confidence", cls_fallback["confidence"])
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except Exception:
+        confidence = float(cls_fallback["confidence"])
+
+    cls_result: Dict[str, Any] = {
+        "classification": classification,
+        "confidence": confidence,
+        "subcategory": normalize_string_list(payload.get("subcategory", cls_fallback.get("subcategory", []))),
+        "justification": str(payload.get("justification", cls_fallback["justification"])).strip(),
+        "quality_issues": normalize_string_list(payload.get("quality_issues", [])),
+    }
+
+    # --- Build quality result ---
+    rewritten = str(payload.get("rewritten_requirement", qual_fallback["rewritten_requirement"])).strip()
+    if not rewritten:
+        rewritten = qual_fallback["rewritten_requirement"]
+
+    # --- Extract priority ---
+    priority = str(payload.get("priority", "")).strip().title()
+    if priority not in {"High", "Medium", "Low"}:
+        priority = fallback_priority(req_text, classification)
+
+    qual_result: Dict[str, Any] = {
+        "score": clamp_int(payload.get("score"), 0, 100, qual_fallback["score"]),
+        "vagueness": normalize_bool(payload.get("vagueness"), qual_fallback["vagueness"]),
+        "missing_elements": normalize_string_list(payload.get("missing_elements", qual_fallback["missing_elements"])),
+        "rewritten_requirement": sanitize_rewritten_requirement(rewritten),
+        "priority": priority,
+        "entities": normalize_string_list(payload.get("entities", fallback_extract_entities(req_text))),
+        "processes": normalize_string_list(payload.get("processes", fallback_extract_processes(req_text))),
+        "data_stores": normalize_string_list(payload.get("data_stores", fallback_extract_data_stores(req_text))),
+    }
+
+    return req_text, cls_result, qual_result
 
 
 # ==============================
@@ -1321,7 +1630,13 @@ async def analyze_requirements(request: AnalysisRequest):
 
                 # Quality module output
                 "is_vague": quality["vagueness"],
-                "quality_score": quality["score"]
+                "quality_score": quality["score"],
+
+                # New: priority & extraction fields
+                "priority": quality.get("priority", "Medium"),
+                "entities": quality.get("entities", []),
+                "processes": quality.get("processes", []),
+                "data_stores": quality.get("data_stores", []),
             }
 
             analysis_result["classifications"].append(item)
@@ -1508,6 +1823,305 @@ async def generate_from_prompt(payload: PromptRequest):
     return {"result": str(parsed)}
 
 
+class ChatRequest(BaseModel):
+    question: str
+    project_context: Optional[str] = None
+    project_id: Optional[str] = None
+
+
+class DiagramRequest(BaseModel):
+    prompt: str
+    diagram_type: str = "component"
+
+
+DIAGRAM_TYPE_EXAMPLES = {
+    "component": (
+        "@startuml\n"
+        "component \"API Gateway\" as GW\n"
+        "component \"Auth Service\" as AUTH\n"
+        "component \"Data Service\" as DATA\n"
+        "database \"Database\" as DB\n"
+        "GW --> AUTH : authenticate\n"
+        "GW --> DATA : request\n"
+        "DATA --> DB : read/write\n"
+        "@enduml"
+    ),
+    "sequence": (
+        "@startuml\n"
+        "actor User\n"
+        "participant \"API Gateway\" as GW\n"
+        "participant \"Auth Service\" as AUTH\n"
+        "participant \"Service\" as SVC\n"
+        "User -> GW : request\n"
+        "GW -> AUTH : verify token\n"
+        "AUTH --> GW : ok\n"
+        "GW -> SVC : process\n"
+        "SVC --> GW : result\n"
+        "GW --> User : response\n"
+        "@enduml"
+    ),
+    "dfd": (
+        "@startuml\n"
+        "actor \"End User\" as U\n"
+        "rectangle \"System\" as SYS\n"
+        "database \"Data Store\" as DS\n"
+        "U --> SYS : input\n"
+        "SYS --> DS : read/write\n"
+        "SYS --> U : output\n"
+        "@enduml"
+    ),
+    "usecase": (
+        "@startuml\n"
+        "actor User\n"
+        "actor Admin\n"
+        "usecase (Login) as UC1\n"
+        "usecase (View Dashboard) as UC2\n"
+        "usecase (Manage Users) as UC3\n"
+        "User --> UC1\n"
+        "User --> UC2\n"
+        "Admin --> UC3\n"
+        "@enduml"
+    ),
+    "er": (
+        "@startuml\n"
+        "entity User {\n"
+        "  * id : UUID\n"
+        "  --\n"
+        "  name : String\n"
+        "  email : String\n"
+        "}\n"
+        "entity Project {\n"
+        "  * id : UUID\n"
+        "  --\n"
+        "  name : String\n"
+        "  description : String\n"
+        "}\n"
+        "entity Requirement {\n"
+        "  * id : UUID\n"
+        "  --\n"
+        "  text : String\n"
+        "  type : String\n"
+        "}\n"
+        "User ||--o{ Project : creates\n"
+        "Project ||--o{ Requirement : contains\n"
+        "@enduml"
+    ),
+}
+
+
+def fallback_diagram_code(prompt: str, diagram_type: str) -> str:
+    """Generate a context-aware PlantUML skeleton when the LLM is unavailable."""
+    example = DIAGRAM_TYPE_EXAMPLES.get(diagram_type, DIAGRAM_TYPE_EXAMPLES["component"])
+    return example
+
+
+def build_diagram_prompt(prompt: str, diagram_type: str) -> str:
+    example = DIAGRAM_TYPE_EXAMPLES.get(diagram_type, DIAGRAM_TYPE_EXAMPLES["component"])
+    return (
+        f"Generate PlantUML diagram code for the following request.\n"
+        f"Diagram type: {diagram_type}\n"
+        f"Request: {prompt}\n\n"
+        f"Return ONLY valid JSON in this exact format:\n"
+        f'{{\"plantuml_code\": \"<full PlantUML code starting @startuml and ending @enduml>\"}}\n\n'
+        f"Example of a {diagram_type} diagram (use as style guide only, not as the answer):\n"
+        f"{example}\n\n"
+        f"Rules:\n"
+        f"1. Code must start with @startuml and end with @enduml.\n"
+        f"2. Tailor node names and relationships to the user's request.\n"
+        f"3. Use readable labels.\n"
+        f"4. Return only JSON, no prose.\n"
+    )
+
+
+def _extract_plantuml(raw: str) -> Optional[str]:
+    """Extract PlantUML code from LLM output — handles JSON-wrapped or plain-text responses."""
+    if not raw:
+        return None
+    # Try JSON parsing first (LLM followed instructions)
+    try:
+        parsed = extract_json_content(raw)
+        if isinstance(parsed, dict):
+            code = parsed.get("plantuml_code") or parsed.get("result", "")
+            if isinstance(code, str) and "@startuml" in code:
+                return code.strip()
+    except Exception:
+        pass
+    # Regex fallback: find @startuml...@enduml block anywhere in the raw text
+    match = re.search(r"(@startuml[\s\S]*?@enduml)", raw, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+@app.post("/generate-diagram")
+async def generate_diagram(request: DiagramRequest):
+    try:
+        global _gemini_disabled
+        prompt = (request.prompt or "").strip()
+        diagram_type = (request.diagram_type or "component").strip().lower()
+
+        if not prompt:
+            raise HTTPException(status_code=422, detail="prompt is required")
+
+        plantuml_code: Optional[str] = None
+        llm_prompt = build_diagram_prompt(prompt, diagram_type)
+
+        # Tier 1: Gemini
+        if GEMINI_API_KEY and not _gemini_disabled:
+            try:
+                raw = await asyncio.wait_for(call_gemini(llm_prompt), timeout=LLM_TIMEOUT_SECONDS)
+                plantuml_code = _extract_plantuml(raw)
+            except Exception as exc:
+                err_lower = str(exc).lower()
+                if any(t in err_lower for t in ["429", "quota", "resourceexhausted", "exceeded"]):
+                    _gemini_disabled = True
+                    logger.warning("Diagram: Gemini quota exhausted — disabling for this session")
+                else:
+                    logger.warning("Diagram Gemini call failed: %s", exc)
+
+        # Tier 2: Ollama (tried even when Gemini is disabled/absent)
+        if not plantuml_code and _ollama_ready:
+            try:
+                raw = await asyncio.wait_for(call_ollama(llm_prompt), timeout=OLLAMA_TIMEOUT_SECONDS)
+                plantuml_code = _extract_plantuml(raw)
+            except Exception as exc:
+                logger.warning("Diagram Ollama call failed: %s", exc)
+
+        # Tier 3: static fallback template
+        if not plantuml_code:
+            plantuml_code = fallback_diagram_code(prompt, diagram_type)
+
+        return {"plantuml_code": plantuml_code, "diagram_type": diagram_type}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("generate-diagram endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
+# ==============================
+# API: CHAT
+# ==============================
+def build_chat_prompt(question: str, context: Optional[str]) -> str:
+    base = (
+        "You are an AI assistant for RAAG (Requirement Analysis & Architecture Generator). "
+        "Your role is to help software engineers understand their project requirements, "
+        "architecture decisions, and quality analysis results.\n\n"
+    )
+    if context:
+        base += f"Project context:\n{context}\n\n"
+    base += (
+        f"User question: {question}\n\n"
+        "Respond helpfully and concisely. Focus on the project requirements and architecture when relevant."
+    )
+    return base
+
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    try:
+        global _gemini_disabled
+        question = (request.question or "").strip()
+        if not question:
+            raise HTTPException(status_code=422, detail="question is required")
+
+        context = request.project_context
+
+        # Auto-fetch project context from MongoDB if a project_id was given
+        if not context and request.project_id:
+            try:
+                from bson import ObjectId
+
+                # Fetch project metadata (name, description, domain)
+                try:
+                    proj = projects_collection.find_one({"_id": ObjectId(request.project_id)})
+                except Exception:
+                    proj = None
+
+                # Fetch latest analysis for classified requirements
+                analysis = analysis_collection.find_one(
+                    {"project_id": request.project_id},
+                    sort=[("analyzed_at", -1)]
+                )
+
+                context_parts = []
+                if proj:
+                    context_parts.append(
+                        f"Project: {proj.get('name', 'Unknown')}\n"
+                        f"Domain: {proj.get('domain', 'General')}\n"
+                        f"Architecture: {proj.get('proposed_architecture', 'Not specified')}\n"
+                        f"Description: {proj.get('description', '')}"
+                    )
+
+                if analysis:
+                    # The analysis stores items under "classifications" (not "requirements")
+                    classifications = analysis.get("classifications", [])
+                    if classifications:
+                        req_lines = []
+                        for r in classifications[:15]:
+                            text = r.get("text", "") if isinstance(r, dict) else str(r)
+                            category = r.get("classification", "") if isinstance(r, dict) else ""
+                            score = r.get("quality_score", "")
+                            vague = " [vague]" if r.get("is_vague") else ""
+                            line = f"- [{category}]{vague} {text}"
+                            if score != "":
+                                line += f" (quality: {score}/100)"
+                            req_lines.append(line)
+                        context_parts.append("Requirements:\n" + "\n".join(req_lines))
+                    overall = analysis.get("overall_quality")
+                    if overall is not None:
+                        context_parts.append(f"Overall quality score: {overall}/100")
+
+                if context_parts:
+                    context = "\n\n".join(context_parts)
+            except Exception as ctx_exc:
+                logger.warning("Could not fetch project context: %s", ctx_exc)
+
+        response_text: Optional[str] = None
+
+        if GEMINI_API_KEY and not _gemini_disabled:
+            try:
+                prompt = build_chat_prompt(question, context)
+                response_text = await asyncio.wait_for(
+                    call_gemini(prompt), timeout=LLM_TIMEOUT_SECONDS
+                )
+            except Exception as exc:
+                err_lower = str(exc).lower()
+                if any(t in err_lower for t in ["429", "quota", "resourceexhausted", "exceeded"]):
+                    _gemini_disabled = True
+                    logger.warning("Chat: Gemini quota exhausted — disabling for this session")
+                else:
+                    logger.warning("Chat Gemini call failed: %s", exc)
+
+        # Fallback to local Ollama model if Gemini unavailable
+        if not response_text and _ollama_ready:
+            try:
+                prompt = build_chat_prompt(question, context)
+                response_text = await asyncio.wait_for(
+                    call_ollama(prompt), timeout=OLLAMA_TIMEOUT_SECONDS
+                )
+                logger.info("Chat served by local Ollama model.")
+            except Exception as exc:
+                logger.warning("Chat Ollama call failed: %s", exc)
+
+        if not response_text:
+            response_text = (
+                "I can help you understand your project requirements and architecture. "
+                "Ask me about specific requirements, architectural decisions, quality issues, "
+                "or best practices. (Local Ollama model is still loading — try again shortly.)"
+            )
+
+        return {"response": response_text}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Chat endpoint failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ==============================
 # HEALTH
 # ==============================
@@ -1518,7 +2132,10 @@ async def health():
         "service": "llm",
         "llm_ready": True,
         "gemini_configured": bool(GEMINI_API_KEY),
-        "gemini_model": GEMINI_MODEL
+        "gemini_model": GEMINI_MODEL,
+        "ollama_ready": _ollama_ready,
+        "ollama_model": OLLAMA_MODEL,
+        "ollama_url": OLLAMA_URL
     }
 
 

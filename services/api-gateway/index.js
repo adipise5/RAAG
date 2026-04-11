@@ -3,12 +3,20 @@ const httpProxy = require('http-proxy');
 const cors = require('cors');
 const amqp = require('amqplib');
 const redis = require('redis');
+const { randomUUID } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
 app.use(cors());
 app.use(express.json());
+
+// Attach a unique request ID to every request so the full call chain
+// across services can be correlated in logs.
+app.use((req, _res, next) => {
+  req.requestId = req.headers['x-request-id'] || randomUUID();
+  next();
+});
 
 let connection, channel, redisClient;
 
@@ -26,14 +34,20 @@ const services = {
 
 const proxies = {};
 Object.entries(services).forEach(([name, target]) => {
-  proxies[name] = httpProxy.createProxyServer({ target });
+  // export: WeasyPrint can be slow (120 s); llm/chatbot: Gemini ~8 s + Ollama ~60 s (90 s); architecture: parallel LLM calls ~15 s max (60 s margin)
+  const timeout = name === 'export' ? 120000 : (name === 'llm' || name === 'chatbot') ? 90000 : name === 'architecture' ? 60000 : 30000;
+  proxies[name] = httpProxy.createProxyServer({ target, timeout, proxyTimeout: timeout });
 });
 
 // Forward JSON body explicitly for proxied requests after express.json() consumes the stream.
+// Also forward the correlation ID to every upstream service.
 Object.values(proxies).forEach((proxy) => {
   proxy.on('proxyReq', (proxyReq, req) => {
+    // Always propagate the correlation ID
+    proxyReq.setHeader('X-Request-ID', req.requestId);
+
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
-    if (!req.body || Object.keys(req.body).length === 0) return;
+    if (typeof req.body === 'undefined') return;
 
     const bodyData = JSON.stringify(req.body);
     proxyReq.setHeader('Content-Type', 'application/json');
@@ -42,11 +56,12 @@ Object.values(proxies).forEach((proxy) => {
   });
 
   proxy.on('error', (err, req, res) => {
-    console.error('Proxy error:', err.message);
+    console.error(`[${req.requestId}] Proxy error:`, err.message);
     if (!res.headersSent) {
       res.status(502).json({
         error: 'Bad Gateway',
-        message: 'Upstream service is unavailable'
+        message: 'Upstream service is unavailable',
+        requestId: req.requestId
       });
     }
   });
@@ -81,10 +96,14 @@ async function initRedis() {
 // Audit event emitter
 async function emitAuditEvent(req, res, next) {
   const startTime = Date.now();
+
+  // Echo the request ID back to the caller so they can reference it
+  res.set('X-Request-ID', req.requestId);
   
   res.on('finish', async () => {
     try {
       const auditEvent = {
+        requestId: req.requestId,
         timestamp: new Date().toISOString(),
         method: req.method,
         path: req.path,
@@ -93,6 +112,8 @@ async function emitAuditEvent(req, res, next) {
         latency: Date.now() - startTime,
         ip: req.ip
       };
+
+      console.log(`[${req.requestId}] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - startTime}ms)`);
       
       if (channel) {
         await channel.publish('audit', '', Buffer.from(JSON.stringify(auditEvent)));
@@ -137,6 +158,13 @@ app.get('/audit/logs', (req, res) => proxies.audit.web(req, res));
 
 app.post('/export/:id', (req, res) => proxies.export.web(req, res));
 app.get('/export/:id', (req, res) => proxies.export.web(req, res));
+
+app.post('/chat', (req, res) => proxies.chatbot.web(req, res));
+app.get('/chat/:projectId', (req, res) => proxies.chatbot.web(req, res));
+
+// Diagram generation: LLM generates PlantUML code, architecture service renders it to SVG
+app.post('/generate-diagram', (req, res) => proxies.llm.web(req, res));
+app.post('/render-diagram', (req, res) => proxies.architecture.web(req, res));
 
 // Root route
 app.get('/', (req, res) => {

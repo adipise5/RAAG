@@ -1,7 +1,17 @@
-FROM rust:latest AS builder
+FROM rust:1.88-slim AS builder
 
 WORKDIR /app
-COPY . .
+
+# Cache dependencies separately from source
+COPY Cargo.toml ./
+# Create a dummy main so cargo can resolve and compile all deps
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release
+# Remove the dummy artifact so the real build links correctly
+RUN rm -f target/release/audit-service target/release/deps/audit_service*
+
+# Now copy the real source and rebuild (only app code recompiles)
+COPY src ./src
 RUN cargo build --release
 
 FROM debian:bookworm-slim

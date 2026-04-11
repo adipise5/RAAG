@@ -1,6 +1,7 @@
 package com.raag.architecture;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import net.sourceforge.plantuml.FileFormat;
 import net.sourceforge.plantuml.FileFormatOption;
 import net.sourceforge.plantuml.SourceStringReader;
@@ -11,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.mapping.Document;
 import org.springframework.data.mongodb.repository.MongoRepository;
 import org.springframework.stereotype.Repository;
@@ -32,6 +34,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 @SpringBootApplication
@@ -127,6 +130,7 @@ class ArchitectureResponse {
     private List<RiskAssumptionItem> riskAndAssumptions;
     private ComplexityEstimate complexityEstimation;
     private NoveltyAssessmentResult noveltyAssessment;
+    private List<GeneratedDiagram> additionalDiagrams;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -166,6 +170,9 @@ class ArchitectureResponse {
 
     public NoveltyAssessmentResult getNoveltyAssessment() { return noveltyAssessment; }
     public void setNoveltyAssessment(NoveltyAssessmentResult noveltyAssessment) { this.noveltyAssessment = noveltyAssessment; }
+
+    public List<GeneratedDiagram> getAdditionalDiagrams() { return additionalDiagrams; }
+    public void setAdditionalDiagrams(List<GeneratedDiagram> additionalDiagrams) { this.additionalDiagrams = additionalDiagrams; }
 }
 
 @Repository
@@ -242,6 +249,12 @@ record NoveltyAssessmentResult(
         String reasoning
 ) {}
 
+record GeneratedDiagram(
+        String title,
+        @JsonProperty("plantuml") String plantUml,
+        String svg
+) {}
+
 @Service
 class ArchitectureService {
 
@@ -251,38 +264,88 @@ class ArchitectureService {
     @Autowired
     private LLMClient llmClient;
 
+    @Autowired
+    private MongoTemplate mongoTemplate;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
     public ArchitectureResponse generateArchitectureReport(ArchitectureRequest request) {
         normalizeRequest(request);
 
+        // Step 1: get architecture style and components (single sequential LLM call)
         Architecture arch = generateArchitecture(request);
-
-        ArchitectureResponse response = new ArchitectureResponse();
-        response.setId(arch.getId());
-        response.setRecommendedStyle(arch.getStyle());
-        response.setProposedStyle(safe(request.getProposedStyle(), "Monolithic"));
-        response.setComplexity(arch.getComplexity());
 
         String description = safe(request.getProjectDescription(), "");
         List<String> requirements = request.getRequirements();
+        String style = arch.getStyle();
+        List<Component> components = arch.getComponents();
+        String domain = safe(request.getDomain(), "General");
 
-        response.setJustification(generateJustificationLLM(description, requirements, arch.getStyle()));
-        response.setComparison(generateComparison(description, requirements, arch.getStyle(), request.getProposedStyle()));
+        // Step 2: launch all LLM-backed sections in parallel — each is bounded to 12s internally
+        CompletableFuture<List<String>> justFuture = CompletableFuture.supplyAsync(
+                () -> generateJustificationLLM(description, requirements, style));
+        CompletableFuture<List<String>> compFuture = CompletableFuture.supplyAsync(
+                () -> generateComparison(description, requirements, style, request.getProposedStyle()));
+        CompletableFuture<List<RequirementQuality>> qualFuture = CompletableFuture.supplyAsync(
+                () -> generateEnhancedQuality(request.getProjectId(), requirements));
+        CompletableFuture<List<RequirementGap>> gapFuture = CompletableFuture.supplyAsync(
+                () -> generateGapAnalysis(requirements));
+        CompletableFuture<TraceabilityMatrixResult> traceFuture = CompletableFuture.supplyAsync(
+                () -> generateTraceabilityMatrix(requirements, components));
+        CompletableFuture<List<RiskAssumptionItem>> riskFuture = CompletableFuture.supplyAsync(
+                () -> generateRiskAndAssumptions(description, requirements));
+        CompletableFuture<ComplexityEstimate> complexFuture = CompletableFuture.supplyAsync(
+                () -> generateComplexityEstimate(requirements));
+        CompletableFuture<NoveltyAssessmentResult> noveltyFuture = CompletableFuture.supplyAsync(
+                () -> generateNoveltyAssessment(description, domain, requirements));
 
-        response.setQualityAnalysis(generateEnhancedQuality(request.getProjectId(), requirements));
-        response.setGapAnalysis(generateGapAnalysis(requirements));
+        // DFD is computed locally — no LLM needed, completes immediately
+        DfdBundle dfdBundle = generateDfdBundle(description, requirements, style, components);
+        List<String> externalEntities = extractExternalEntities(description, requirements);
+        List<GeneratedDiagram> additionalDiagrams = generateAdditionalDiagrams(
+                description, requirements, style, components, externalEntities
+        );
 
-        DfdBundle dfdBundle = generateDfdBundle(description, requirements, arch.getStyle(), arch.getComponents());
+        // Step 3: collect all parallel results (all bounded by 12s WebClient timeout + fallbacks)
+        ArchitectureResponse response = new ArchitectureResponse();
+        response.setId(arch.getId());
+        response.setRecommendedStyle(style);
+        response.setProposedStyle(safe(request.getProposedStyle(), "Monolithic"));
+        response.setComplexity(arch.getComplexity());
+        response.setJustification(justFuture.join());
+        response.setComparison(compFuture.join());
+        response.setQualityAnalysis(qualFuture.join());
+        response.setGapAnalysis(gapFuture.join());
         response.setDfd(dfdBundle);
+        response.setTraceabilityMatrix(traceFuture.join());
+        response.setRiskAndAssumptions(riskFuture.join());
+        response.setComplexityEstimation(complexFuture.join());
+        response.setNoveltyAssessment(noveltyFuture.join());
+        response.setAdditionalDiagrams(additionalDiagrams);
 
         if (dfdBundle != null && dfdBundle.level1() != null) {
             arch.setDiagram(dfdBundle.level1().plantUml());
             repository.save(arch);
         }
 
-        response.setTraceabilityMatrix(generateTraceabilityMatrix(requirements, arch.getComponents()));
-        response.setRiskAndAssumptions(generateRiskAndAssumptions(description, requirements));
-        response.setComplexityEstimation(generateComplexityEstimate(requirements));
-        response.setNoveltyAssessment(generateNoveltyAssessment(description, safe(request.getDomain(), "General"), requirements));
+        // Persist the full architecture response for PDF export
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> reportDoc = objectMapper.convertValue(response, Map.class);
+            reportDoc.put("projectId", request.getProjectId());
+            reportDoc.put("savedAt", new Date());
+            // Remove any prior report for this project
+            mongoTemplate.remove(
+                    new org.springframework.data.mongodb.core.query.Query(
+                            org.springframework.data.mongodb.core.query.Criteria.where("projectId").is(request.getProjectId())
+                    ),
+                    "architecture_reports"
+            );
+            mongoTemplate.save(new org.bson.Document(reportDoc), "architecture_reports");
+        } catch (Exception e) {
+            // Non-critical — PDF export will just miss architecture data
+            System.err.println("Failed to persist architecture report: " + e.getMessage());
+        }
 
         return response;
     }
@@ -328,7 +391,7 @@ class ArchitectureService {
     private String callLLMForRecommendation(String description, List<String> requirements) {
 
         String prompt = String.format("""
-You are a software architect.
+You are a software architect. Analyze the project and recommend the best architecture.
 
 Project:
 %s
@@ -336,10 +399,18 @@ Project:
 Requirements:
 %s
 
-Choose best architecture from:
+Candidate architectures:
 Microservices, Monolithic, Serverless, Event-Driven, Layered, SOA, Hexagonal, CQRS, P2P
 
-Return only one architecture name.
+Evaluation criteria:
+1. Scalability: Does the project need horizontal scaling or handle high concurrency?
+2. Coupling: Do requirements suggest independent deployable units or tightly coupled modules?
+3. Data flow: Is data flow event-based/streaming or request-response?
+4. Team size: Complex distributed systems need larger teams.
+5. Latency: Real-time requirements favor event-driven; simple CRUD favors monolithic.
+6. Compliance: Regulated domains may need clear boundaries (microservices/hexagonal).
+
+Return ONLY the architecture name. No explanation.
 """, safe(description, ""), formatRequirements(requirements));
 
         Map<String, Object> response = llmClient.callCustomPrompt(prompt);
@@ -354,7 +425,7 @@ Return only one architecture name.
 
     public List<String> generateJustificationLLM(String description, List<String> requirements, String recommended) {
         String prompt = String.format("""
-Explain why %s is best for this project:
+Explain why %s architecture is the best fit for this project.
 
 Project:
 %s
@@ -362,8 +433,10 @@ Project:
 Requirements:
 %s
 
-Give 3-5 specific reasons.
-Return JSON array.
+For each reason, reference specific requirements or project characteristics.
+Cover these dimensions: scalability, maintainability, deployment flexibility, data management, and team productivity.
+Give 3-5 specific, actionable reasons.
+Return a JSON array of strings. No markdown, no prose outside the array.
 """, recommended, safe(description, ""), formatRequirements(requirements));
 
         Map<String, Object> response = llmClient.callCustomPrompt(prompt);
@@ -784,30 +857,120 @@ Return JSON array.
             coverage.put(component, 0);
         }
 
+        // Domain-aware keyword mapping: requirement keywords -> component keywords
+        Map<String, List<String>> domainHints = Map.ofEntries(
+                Map.entry("auth", List.of("auth", "gateway", "identity", "user")),
+                Map.entry("login", List.of("auth", "gateway", "identity", "user")),
+                Map.entry("password", List.of("auth", "identity", "user")),
+                Map.entry("register", List.of("auth", "user", "gateway")),
+                Map.entry("session", List.of("auth", "gateway")),
+                Map.entry("token", List.of("auth", "gateway")),
+                Map.entry("role", List.of("auth", "identity")),
+                Map.entry("permission", List.of("auth", "identity")),
+                Map.entry("encrypt", List.of("auth", "gateway", "service")),
+                Map.entry("security", List.of("auth", "gateway", "audit")),
+                Map.entry("user", List.of("user", "auth", "gateway")),
+                Map.entry("patient", List.of("user", "service", "requirement")),
+                Map.entry("customer", List.of("user", "service", "requirement")),
+                Map.entry("store", List.of("service", "data", "requirement")),
+                Map.entry("database", List.of("service", "data", "requirement")),
+                Map.entry("persist", List.of("service", "data", "requirement")),
+                Map.entry("save", List.of("service", "data", "requirement")),
+                Map.entry("record", List.of("service", "data", "requirement", "audit")),
+                Map.entry("retrieve", List.of("service", "query", "requirement")),
+                Map.entry("search", List.of("service", "query", "requirement", "analysis")),
+                Map.entry("filter", List.of("service", "query", "analysis")),
+                Map.entry("report", List.of("reporting", "analysis", "architecture", "service")),
+                Map.entry("dashboard", List.of("reporting", "analysis", "service")),
+                Map.entry("display", List.of("reporting", "service", "gateway")),
+                Map.entry("view", List.of("reporting", "query", "service")),
+                Map.entry("monitor", List.of("audit", "reporting", "service")),
+                Map.entry("notify", List.of("notification", "worker", "event")),
+                Map.entry("alert", List.of("notification", "worker", "event")),
+                Map.entry("email", List.of("notification", "worker")),
+                Map.entry("sms", List.of("notification", "worker")),
+                Map.entry("payment", List.of("payment", "billing", "gateway")),
+                Map.entry("billing", List.of("payment", "billing", "gateway")),
+                Map.entry("invoice", List.of("payment", "billing", "service")),
+                Map.entry("audit", List.of("audit", "compliance", "service")),
+                Map.entry("compliance", List.of("audit", "compliance", "service")),
+                Map.entry("log", List.of("audit", "gateway", "service")),
+                Map.entry("track", List.of("audit", "service", "analysis")),
+                Map.entry("api", List.of("gateway", "api")),
+                Map.entry("endpoint", List.of("gateway", "api", "service")),
+                Map.entry("request", List.of("gateway", "service", "command")),
+                Map.entry("response", List.of("gateway", "service")),
+                Map.entry("analyze", List.of("analysis", "architecture", "service")),
+                Map.entry("analysis", List.of("analysis", "architecture", "service")),
+                Map.entry("process", List.of("service", "worker", "command")),
+                Map.entry("generate", List.of("architecture", "service", "function")),
+                Map.entry("export", List.of("reporting", "service")),
+                Map.entry("import", List.of("service", "requirement", "gateway")),
+                Map.entry("upload", List.of("service", "gateway", "requirement")),
+                Map.entry("download", List.of("service", "gateway", "reporting")),
+                Map.entry("performance", List.of("gateway", "service", "architecture")),
+                Map.entry("scalab", List.of("gateway", "architecture", "service")),
+                Map.entry("availab", List.of("gateway", "architecture", "service")),
+                Map.entry("reliab", List.of("gateway", "architecture", "service")),
+                Map.entry("backup", List.of("service", "data", "architecture")),
+                Map.entry("recover", List.of("service", "data", "architecture")),
+                Map.entry("event", List.of("event", "bus", "worker", "projection")),
+                Map.entry("real-time", List.of("event", "bus", "worker", "notification")),
+                Map.entry("message", List.of("event", "bus", "notification", "worker")),
+                Map.entry("queue", List.of("event", "bus", "worker")),
+                Map.entry("chat", List.of("chatbot", "service", "gateway")),
+                Map.entry("schedule", List.of("service", "worker", "function")),
+                Map.entry("config", List.of("gateway", "service", "architecture")),
+                Map.entry("integrat", List.of("gateway", "service", "architecture"))
+        );
+
         for (String requirement : requirements) {
             String lower = requirement.toLowerCase(Locale.ROOT);
-            List<String> mapped = componentNames.stream()
-                    .filter(component -> {
-                        String[] tokens = component.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
-                        for (String token : tokens) {
-                            if (token.length() > 2 && lower.contains(token)) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    })
-                    .collect(Collectors.toCollection(ArrayList::new));
+            Set<String> mapped = new LinkedHashSet<>();
 
-            if (mapped.isEmpty() && lower.contains("user")) {
-                componentNames.stream()
-                        .filter(component -> component.toLowerCase(Locale.ROOT).contains("gateway"))
-                        .findFirst()
-                        .ifPresent(mapped::add);
+            // Strategy 1: domain-aware keyword matching
+            for (Map.Entry<String, List<String>> entry : domainHints.entrySet()) {
+                if (lower.contains(entry.getKey())) {
+                    for (String hint : entry.getValue()) {
+                        componentNames.stream()
+                                .filter(c -> c.toLowerCase(Locale.ROOT).contains(hint))
+                                .forEach(mapped::add);
+                    }
+                }
             }
 
-            matrix.add(new TraceabilityEntry(requirement, mapped));
+            // Strategy 2: direct token matching (original logic)
+            if (mapped.isEmpty()) {
+                componentNames.stream()
+                        .filter(component -> {
+                            String[] tokens = component.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
+                            for (String token : tokens) {
+                                if (token.length() > 2 && lower.contains(token)) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        })
+                        .forEach(mapped::add);
+            }
 
-            for (String component : mapped) {
+            // Strategy 3: assign to gateway + first service as last resort
+            if (mapped.isEmpty()) {
+                componentNames.stream()
+                        .filter(c -> c.toLowerCase(Locale.ROOT).contains("gateway"))
+                        .findFirst().ifPresent(mapped::add);
+                componentNames.stream()
+                        .filter(c -> {
+                            String l = c.toLowerCase(Locale.ROOT);
+                            return l.contains("requirement") || l.contains("main") || l.contains("application");
+                        })
+                        .findFirst().ifPresent(mapped::add);
+            }
+
+            List<String> mappedList = new ArrayList<>(mapped);
+            matrix.add(new TraceabilityEntry(requirement, mappedList));
+
+            for (String component : mappedList) {
                 coverage.put(component, coverage.getOrDefault(component, 0) + 1);
             }
         }
@@ -924,6 +1087,337 @@ Return JSON array.
                 fallbackBreakdown,
                 "Novelty estimated from requirement breadth, domain complexity, and architectural approach."
         );
+    }
+
+    // ============================
+    // MODULE 8: ADDITIONAL DIAGRAMS
+    // ============================
+    private List<GeneratedDiagram> generateAdditionalDiagrams(
+            String description,
+            List<String> requirements,
+            String architectureStyle,
+            List<Component> components,
+            List<String> externalEntities
+    ) {
+        List<GeneratedDiagram> diagrams = new ArrayList<>();
+
+        // 1. Component Diagram
+        diagrams.add(buildComponentDiagram(architectureStyle, components));
+
+        // 2. Use Case Diagram
+        diagrams.add(buildUseCaseDiagram(requirements, externalEntities));
+
+        // 3. Deployment Diagram
+        diagrams.add(buildDeploymentDiagram(architectureStyle, components));
+
+        // 4. Sequence Diagram
+        diagrams.add(buildSequenceDiagram(architectureStyle, components));
+
+        return diagrams;
+    }
+
+    private GeneratedDiagram buildComponentDiagram(String style, List<Component> components) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("@startuml\n");
+        sb.append("skinparam shadowing false\n");
+        sb.append("skinparam componentStyle uml2\n");
+        sb.append("title Component Diagram — ").append(escapePlant(safe(style, "Architecture"))).append("\n\n");
+
+        // Group components by type
+        Map<String, List<Component>> byType = new java.util.LinkedHashMap<>();
+        for (Component c : components) {
+            byType.computeIfAbsent(safe(c.getType(), "Service"), k -> new ArrayList<>()).add(c);
+        }
+
+        for (Map.Entry<String, List<Component>> entry : byType.entrySet()) {
+            String type = entry.getKey();
+            sb.append("package \"").append(escapePlant(type)).append("\" {\n");
+            for (Component c : entry.getValue()) {
+                sb.append("  [").append(escapePlant(c.getName())).append("] <<").append(escapePlant(type)).append(">>\n");
+            }
+            sb.append("}\n\n");
+        }
+
+        // Dependencies
+        for (Component c : components) {
+            if (c.getDependencies() == null) continue;
+            for (String dep : c.getDependencies()) {
+                if (dep == null || dep.isBlank()) continue;
+                sb.append("[").append(escapePlant(dep)).append("] --> [").append(escapePlant(c.getName())).append("]\n");
+            }
+        }
+
+        sb.append("@enduml\n");
+        String puml = sb.toString();
+        return new GeneratedDiagram("Component Diagram", puml, renderSvg(puml));
+    }
+
+    private GeneratedDiagram buildUseCaseDiagram(List<String> requirements, List<String> actors) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("@startuml\n");
+        sb.append("left to right direction\n");
+        sb.append("skinparam shadowing false\n");
+        sb.append("skinparam packageStyle rectangle\n");
+        sb.append("title Use Case Diagram\n\n");
+
+        // Actors
+        for (String actor : actors) {
+            sb.append("actor \"").append(escapePlant(actor)).append("\" as ").append(alias(actor)).append("\n");
+        }
+        sb.append("\n");
+
+        sb.append("rectangle \"System\" {\n");
+
+        // Convert requirements to use cases — abbreviate long ones
+        int count = 0;
+        List<String> ucAliases = new ArrayList<>();
+        for (String req : requirements) {
+            count++;
+            String ucAlias = "UC" + count;
+            ucAliases.add(ucAlias);
+
+            // Extract a short label: take first meaningful clause, max 60 chars
+            String label = req.replaceAll("(?i)^\\s*(the\\s+system\\s+)?(shall|must|should|will|can)\\s+", "").trim();
+            if (label.length() > 60) {
+                label = label.substring(0, 57) + "...";
+            }
+            if (label.isBlank()) label = "Requirement " + count;
+
+            sb.append("  usecase \"").append(escapePlant(label)).append("\" as ").append(ucAlias).append("\n");
+        }
+        sb.append("}\n\n");
+
+        // Connect actors to use cases — primary actor to all, others to subset
+        if (!actors.isEmpty()) {
+            String primaryAlias = alias(actors.get(0));
+            for (String ucAlias : ucAliases) {
+                sb.append(primaryAlias).append(" --> ").append(ucAlias).append("\n");
+            }
+            // Secondary actors connect to a relevant subset
+            for (int i = 1; i < actors.size(); i++) {
+                String actorAlias = alias(actors.get(i));
+                String actorLower = actors.get(i).toLowerCase(Locale.ROOT);
+                for (int j = 0; j < requirements.size(); j++) {
+                    String reqLower = requirements.get(j).toLowerCase(Locale.ROOT);
+                    boolean relevant = false;
+                    if (actorLower.contains("admin") && (reqLower.contains("admin") || reqLower.contains("manage") || reqLower.contains("config"))) relevant = true;
+                    if (actorLower.contains("payment") && (reqLower.contains("payment") || reqLower.contains("billing") || reqLower.contains("invoice"))) relevant = true;
+                    if (actorLower.contains("external") && (reqLower.contains("integrat") || reqLower.contains("third-party") || reqLower.contains("external"))) relevant = true;
+                    if (actorLower.contains("regulator") && (reqLower.contains("compliance") || reqLower.contains("audit") || reqLower.contains("regulat"))) relevant = true;
+                    if (relevant) {
+                        sb.append(actorAlias).append(" --> ").append(ucAliases.get(j)).append("\n");
+                    }
+                }
+            }
+        }
+
+        sb.append("@enduml\n");
+        String puml = sb.toString();
+        return new GeneratedDiagram("Use Case Diagram", puml, renderSvg(puml));
+    }
+
+    private GeneratedDiagram buildDeploymentDiagram(String style, List<Component> components) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("@startuml\n");
+        sb.append("skinparam shadowing false\n");
+        sb.append("title Deployment Diagram — ").append(escapePlant(safe(style, "Architecture"))).append("\n\n");
+
+        String normalized = safe(style, "Monolithic").toLowerCase(Locale.ROOT);
+
+        if (normalized.contains("micro") || normalized.contains("soa")) {
+            // Each service gets its own container node
+            sb.append("node \"Load Balancer\" as LB\n\n");
+            for (Component c : components) {
+                String cAlias = alias(c.getName());
+                String nodeType = c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("gateway") ? "node" : "node";
+                sb.append(nodeType).append(" \"Container: ").append(escapePlant(c.getName())).append("\" as ").append(cAlias).append(" {\n");
+                sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" <<").append(escapePlant(safe(c.getType(), "Service"))).append(">>\n");
+                sb.append("}\n");
+            }
+            sb.append("\ncloud \"Message Broker\" as MQ\n");
+            sb.append("database \"Primary Database\" as DB\n");
+            sb.append("database \"Cache\" as Cache\n\n");
+
+            // Connect LB to gateway
+            components.stream()
+                    .filter(c -> c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("gateway"))
+                    .findFirst()
+                    .ifPresent(gw -> sb.append("LB --> ").append(alias(gw.getName())).append("\n"));
+
+            // Connect services
+            for (Component c : components) {
+                if (c.getDependencies() == null) continue;
+                for (String dep : c.getDependencies()) {
+                    if (dep == null || dep.isBlank()) continue;
+                    sb.append(alias(dep)).append(" --> ").append(alias(c.getName())).append("\n");
+                }
+            }
+
+            // Connect some services to DB/MQ
+            for (Component c : components) {
+                String lower = c.getName().toLowerCase(Locale.ROOT);
+                if (lower.contains("service") || lower.contains("worker") || lower.contains("layer") || lower.contains("application")) {
+                    sb.append(alias(c.getName())).append(" --> DB\n");
+                    break;
+                }
+            }
+            components.stream()
+                    .filter(c -> {
+                        String l = c.getName().toLowerCase(Locale.ROOT);
+                        return l.contains("event") || l.contains("notification") || l.contains("worker") || l.contains("bus");
+                    })
+                    .findFirst()
+                    .ifPresent(c -> sb.append(alias(c.getName())).append(" --> MQ\n"));
+
+        } else if (normalized.contains("serverless")) {
+            sb.append("cloud \"Cloud Provider\" {\n");
+            sb.append("  node \"API Gateway\" as APIGW\n");
+            for (Component c : components) {
+                if (c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("function")) {
+                    sb.append("  node \"Lambda: ").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n");
+                }
+            }
+            sb.append("  database \"Managed DB\" as DB\n");
+            sb.append("  storage \"Object Storage\" as S3\n");
+            sb.append("}\n\n");
+            sb.append("actor \"Client\" as Client\n");
+            sb.append("Client --> APIGW\n");
+            for (Component c : components) {
+                if (c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("function")) {
+                    sb.append("APIGW --> ").append(alias(c.getName())).append("\n");
+                    sb.append(alias(c.getName())).append(" --> DB\n");
+                }
+            }
+
+        } else if (normalized.contains("event")) {
+            sb.append("node \"Load Balancer\" as LB\n");
+            sb.append("queue \"Event Bus / Message Broker\" as EB\n\n");
+            for (Component c : components) {
+                sb.append("node \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n");
+            }
+            sb.append("\ndatabase \"Event Store\" as ES\n");
+            sb.append("database \"Read DB\" as RDB\n\n");
+
+            components.stream()
+                    .filter(c -> c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("gateway"))
+                    .findFirst()
+                    .ifPresent(gw -> sb.append("LB --> ").append(alias(gw.getName())).append("\n"));
+
+            for (Component c : components) {
+                String lower = c.getName().toLowerCase(Locale.ROOT);
+                if (lower.contains("bus") || lower.contains("event")) {
+                    sb.append(alias(c.getName())).append(" --> EB\n");
+                } else if (lower.contains("command")) {
+                    sb.append(alias(c.getName())).append(" --> EB\n");
+                    sb.append(alias(c.getName())).append(" --> ES\n");
+                } else if (lower.contains("query") || lower.contains("projection")) {
+                    sb.append("EB --> ").append(alias(c.getName())).append("\n");
+                    sb.append(alias(c.getName())).append(" --> RDB\n");
+                } else if (lower.contains("worker") || lower.contains("notification")) {
+                    sb.append("EB --> ").append(alias(c.getName())).append("\n");
+                }
+            }
+
+        } else {
+            // Monolithic / Layered
+            sb.append("node \"Application Server\" {\n");
+            for (Component c : components) {
+                sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n");
+            }
+            sb.append("}\n\n");
+            sb.append("database \"Database\" as DB\n");
+            sb.append("actor \"Client\" as Client\n\n");
+
+            components.stream().findFirst()
+                    .ifPresent(c -> sb.append("Client --> ").append(alias(c.getName())).append("\n"));
+
+            for (Component c : components) {
+                if (c.getDependencies() == null) continue;
+                for (String dep : c.getDependencies()) {
+                    if (dep == null || dep.isBlank()) continue;
+                    sb.append(alias(dep)).append(" --> ").append(alias(c.getName())).append("\n");
+                }
+            }
+            // Last component/layer connects to DB
+            if (!components.isEmpty()) {
+                sb.append(alias(components.get(components.size() - 1).getName())).append(" --> DB\n");
+            }
+        }
+
+        sb.append("@enduml\n");
+        String puml = sb.toString();
+        return new GeneratedDiagram("Deployment Diagram", puml, renderSvg(puml));
+    }
+
+    private GeneratedDiagram buildSequenceDiagram(String style, List<Component> components) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("@startuml\n");
+        sb.append("skinparam shadowing false\n");
+        sb.append("title Request Flow — ").append(escapePlant(safe(style, "Architecture"))).append("\n\n");
+
+        // Participants
+        sb.append("actor \"User\" as User\n");
+        for (Component c : components) {
+            String stereotype = safe(c.getType(), "Service");
+            sb.append("participant \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append(" <<").append(escapePlant(stereotype)).append(">>\n");
+        }
+        sb.append("database \"Database\" as DB\n\n");
+
+        // Build a typical request flow through the dependency chain
+        if (!components.isEmpty()) {
+            Component entry = components.get(0); // first component is typically gateway/entry point
+            sb.append("User -> ").append(alias(entry.getName())).append(" : HTTP Request\n");
+            sb.append("activate ").append(alias(entry.getName())).append("\n");
+
+            // Walk the dependency chain
+            Set<String> activated = new LinkedHashSet<>();
+            activated.add(alias(entry.getName()));
+            List<String> callStack = new ArrayList<>();
+            callStack.add(alias(entry.getName()));
+
+            for (int i = 1; i < components.size(); i++) {
+                Component c = components.get(i);
+                // Find which already-activated component calls this one
+                String caller = null;
+                if (c.getDependencies() != null) {
+                    for (String dep : c.getDependencies()) {
+                        if (dep != null && activated.contains(alias(dep))) {
+                            caller = alias(dep);
+                            break;
+                        }
+                    }
+                }
+                if (caller == null) {
+                    caller = callStack.get(callStack.size() - 1);
+                }
+
+                String callee = alias(c.getName());
+                sb.append(caller).append(" -> ").append(callee).append(" : process\n");
+                sb.append("activate ").append(callee).append("\n");
+                activated.add(callee);
+                callStack.add(callee);
+            }
+
+            // Last component queries DB
+            String last = callStack.get(callStack.size() - 1);
+            sb.append(last).append(" -> DB : query/persist\n");
+            sb.append("DB --> ").append(last).append(" : result\n");
+
+            // Return responses back up the chain
+            for (int i = callStack.size() - 1; i >= 1; i--) {
+                String callee = callStack.get(i);
+                String caller = callStack.get(i - 1);
+                sb.append(callee).append(" --> ").append(caller).append(" : response\n");
+                sb.append("deactivate ").append(callee).append("\n");
+            }
+
+            sb.append(alias(entry.getName())).append(" --> User : HTTP Response\n");
+            sb.append("deactivate ").append(alias(entry.getName())).append("\n");
+        }
+
+        sb.append("@enduml\n");
+        String puml = sb.toString();
+        return new GeneratedDiagram("Sequence Diagram", puml, renderSvg(puml));
     }
 
     // ============================
@@ -1128,6 +1622,10 @@ Return JSON array.
                 .replace("'", "&#39;");
     }
 
+    public String renderDiagramPublic(String plantUml) {
+        return renderSvg(plantUml);
+    }
+
     // ============================
     // MOCKS FOR FALLBACK
     // ============================
@@ -1177,6 +1675,23 @@ class ArchitectureController {
     @PostMapping("/generate-architecture/advanced")
     public ArchitectureResponse generateArchitectureAdvanced(@RequestBody ArchitectureRequest request) {
         return service.generateArchitectureReport(request);
+    }
+
+    record RenderDiagramRequest(String code) {}
+    record RenderDiagramResponse(String svg, String code) {}
+
+    @PostMapping("/render-diagram")
+    public RenderDiagramResponse renderDiagram(@RequestBody RenderDiagramRequest request) {
+        String plantUml = request.code() == null ? "" : request.code().trim();
+        if (plantUml.isEmpty()) {
+            return new RenderDiagramResponse(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"40\">"
+                + "<text x=\"10\" y=\"25\" fill=\"#b00020\">No diagram code provided.</text></svg>",
+                plantUml
+            );
+        }
+        String svg = service.renderDiagramPublic(plantUml);
+        return new RenderDiagramResponse(svg, plantUml);
     }
 
     @GetMapping("/health")

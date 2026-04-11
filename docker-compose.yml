@@ -1,5 +1,9 @@
 version: '3.8'
 
+# Enable BuildKit for faster, cached parallel builds:
+#   $env:DOCKER_BUILDKIT=1; $env:COMPOSE_DOCKER_CLI_BUILD=1; docker compose build --parallel
+# Or just run:  docker compose build --parallel
+
 services:
   # Databases
   mongodb:
@@ -13,6 +17,12 @@ services:
       - mongo_data:/data/db
     networks:
       - raag-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   postgres:
     image: postgres:15
@@ -26,6 +36,12 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - raag-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d raag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
@@ -33,6 +49,12 @@ services:
       - "6379:6379"
     networks:
       - raag-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   rabbitmq:
     image: rabbitmq:3.12-management
@@ -46,6 +68,12 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
     networks:
       - raag-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # API Gateway
   api-gateway:
@@ -55,9 +83,12 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - mongodb
-      - redis
-      - rabbitmq
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
       NODE_ENV: development
       MONGO_URL: mongodb://admin:password@mongodb:27017
@@ -74,7 +105,8 @@ services:
     ports:
       - "8008:8008"
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
     environment:
       PORT: 8008
       MONGO_URL: mongodb://admin:password@mongodb:27017
@@ -90,8 +122,10 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      - mongodb
-      - rabbitmq
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
       PORT: 8001
       MONGO_URL: mongodb://admin:password@mongodb:27017
@@ -107,13 +141,18 @@ services:
     ports:
       - "8002:8002"
     depends_on:
-      - mongodb
-      - rabbitmq
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
       PORT: 8002
       MONGO_URL: mongodb://admin:password@mongodb:27017
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       GEMINI_API_KEY: ${GEMINI_API_KEY:-placeholder}
+      GEMINI_MODEL: gemini-2.0-flash-lite
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: llama3.1:8b
     networks:
       - raag-network
 
@@ -125,7 +164,8 @@ services:
     ports:
       - "8004:8004"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       PORT: 8004
       DB_HOST: postgres
@@ -143,8 +183,10 @@ services:
     ports:
       - "8003:8003"
     depends_on:
-      - mongodb
-      - llm-service
+      mongodb:
+        condition: service_healthy
+      llm-service:
+        condition: service_started
     environment:
       PORT: 8003
       MONGO_URL: mongodb://admin:password@mongodb:27017
@@ -160,8 +202,10 @@ services:
     ports:
       - "8005:8005"
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
       PORT: 8005
       DB_HOST: postgres
@@ -180,7 +224,8 @@ services:
     ports:
       - "8006:8006"
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
     environment:
       PORT: 8006
       MONGO_URL: mongodb://admin:password@mongodb:27017
@@ -195,14 +240,38 @@ services:
     ports:
       - "8007:8007"
     depends_on:
-      - mongodb
-      - redis
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      llm-service:
+        condition: service_started
     environment:
       PORT: 8007
       NODE_ENV: development
       MONGO_URL: mongodb://admin:password@mongodb:27017
       REDIS_URL: redis://redis:6379
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-placeholder}
+      LLM_SERVICE_URL: http://llm-service:8002
+    networks:
+      - raag-network
+
+  # Local LLM — Ollama (llama3.1:8b, ~4.7 GB VRAM, fits RTX 4060 8 GB)
+  # Requires NVIDIA Container Toolkit on the host:
+  #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  # The model is pulled automatically on first start (background, ~4.7 GB download).
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     networks:
       - raag-network
 
@@ -212,9 +281,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3000:80"
     depends_on:
-      - api-gateway
+      api-gateway:
+        condition: service_started
     environment:
       REACT_APP_API_URL: http://localhost:8000
     networks:
@@ -224,6 +294,7 @@ volumes:
   mongo_data:
   postgres_data:
   rabbitmq_data:
+  ollama_data:
 
 networks:
   raag-network:

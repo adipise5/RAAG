@@ -16,7 +16,7 @@ app.use(express.json());
 
 const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27017';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const LLM_SERVICE_URL = process.env.LLM_SERVICE_URL || 'http://llm-service:8002';
 
 let mongoClient, chatCollection, redisClient;
 
@@ -62,8 +62,8 @@ io.on('connection', (socket) => {
     const { projectId, message, userId } = data;
     
     try {
-      // Mock response (in production, call Gemini API)
-      const response = await generateChatResponse(message);
+      // Call LLM service for an intelligent response with project context
+      const response = await generateChatResponse(message, projectId);
       
       const chatMessage = {
         timestamp: new Date().toISOString(),
@@ -100,26 +100,25 @@ io.on('connection', (socket) => {
   });
 });
 
-async function generateChatResponse(userMessage) {
-  const messageLower = userMessage.toLowerCase();
-  
-  // Mock responses based on keywords
-  const responses = {
-    'requirement': 'Requirements are functional and non-functional specifications that define what the system should do.',
-    'architecture': 'Architecture refers to the high-level structure of your system, including how components interact.',
-    'quality': 'Quality scores are based on IEEE 830 standards, measuring specificity and completeness of requirements.',
-    'vague': 'Vague requirements contain ambiguous terms like "fast", "easy", or "good". Try to be more specific.',
-    'design': 'The system architecture helps you understand how different components work together.',
-    'default': 'I can help you understand your requirements, architecture, and quality analysis. What would you like to know?'
-  };
-
-  for (const [key, response] of Object.entries(responses)) {
-    if (messageLower.includes(key)) {
-      return response;
-    }
+async function generateChatResponse(userMessage, projectId) {
+  try {
+    const body = JSON.stringify({ question: userMessage, project_id: projectId || null });
+    const res = await fetch(`${LLM_SERVICE_URL}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      signal: AbortSignal.timeout(75000)
+    });
+    if (!res.ok) throw new Error(`LLM service returned ${res.status}`);
+    const data = await res.json();
+    return data.response || 'Sorry, I could not generate a response.';
+  } catch (err) {
+    console.error('LLM call failed, using fallback:', err.message);
+    return (
+      'I can help you understand your project requirements and architecture. ' +
+      'Ask me about specific requirements, quality issues, or architectural decisions.'
+    );
   }
-
-  return responses.default;
 }
 
 // REST API endpoints
@@ -141,7 +140,7 @@ app.get('/chat/:projectId', async (req, res) => {
 app.post('/chat', async (req, res) => {
   try {
     const { projectId, message, userId } = req.body;
-    const response = await generateChatResponse(message);
+    const response = await generateChatResponse(message, projectId);
     
     const chatMessage = {
       timestamp: new Date().toISOString(),
@@ -162,7 +161,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'chatbot',
-    gemini_configured: !!GEMINI_API_KEY
+    llm_service: LLM_SERVICE_URL
   });
 });
 

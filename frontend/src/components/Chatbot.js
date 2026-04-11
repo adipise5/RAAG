@@ -8,17 +8,34 @@ function Chatbot({ projectId, apiUrl }) {
   const [socket, setSocket] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
-    // Initialize Socket.io connection
-    const socketUrl = apiUrl.replace('/api', '').replace(':8000', ':8007');
-    const newSocket = io(socketUrl);
+    // Chatbot-service is exposed on :8007; strip the gateway port and swap in chatbot port.
+    // apiUrl = 'http://localhost:8000' → socketUrl = 'http://localhost:8007'
+    const socketUrl = apiUrl.replace(':8000', ':8007');
+    const newSocket = io(socketUrl, { timeout: 5000 });
+
+    // Give the socket 6 s to connect before falling back to REST-only mode
+    const connectTimeout = setTimeout(() => {
+      if (!newSocket.connected) {
+        setLoading(false);
+        setIsConnected(false);
+      }
+    }, 6000);
 
     newSocket.on('connect', () => {
+      clearTimeout(connectTimeout);
       setIsConnected(true);
       setLoading(false);
       newSocket.emit('join-project', projectId);
+    });
+
+    newSocket.on('connect_error', () => {
+      clearTimeout(connectTimeout);
+      setLoading(false);
+      setIsConnected(false);
     });
 
     newSocket.on('chat-history', (history) => {
@@ -40,6 +57,7 @@ function Chatbot({ projectId, apiUrl }) {
     setSocket(newSocket);
 
     return () => {
+      clearTimeout(connectTimeout);
       newSocket.close();
     };
   }, [projectId, apiUrl]);
@@ -50,10 +68,11 @@ function Chatbot({ projectId, apiUrl }) {
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
-    if (!inputValue.trim()) return;
+    if (!inputValue.trim() || sending) return;
 
     const userMessage = inputValue;
     setInputValue('');
+    setSending(true);
 
     if (socket && isConnected) {
       socket.emit('message', {
@@ -61,8 +80,9 @@ function Chatbot({ projectId, apiUrl }) {
         message: userMessage,
         userId: 'user'
       });
+      setSending(false);
     } else {
-      // Fallback to REST API
+      // REST fallback when socket is unavailable
       try {
         const response = await axios.post(`${apiUrl}/chat`, {
           projectId,
@@ -77,6 +97,13 @@ function Chatbot({ projectId, apiUrl }) {
         }]);
       } catch (err) {
         console.error('Error sending message:', err);
+        setMessages(prev => [...prev, {
+          timestamp: new Date().toISOString(),
+          userMessage,
+          botResponse: 'Failed to send message. Please try again.'
+        }]);
+      } finally {
+        setSending(false);
       }
     }
   };
@@ -92,12 +119,20 @@ function Chatbot({ projectId, apiUrl }) {
 
   return (
     <div className="chatbot-container">
+      <div style={{ padding: '14px 20px', borderBottom: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff' }}>
+        <span style={{ fontWeight: 600, fontSize: '0.95rem', color: '#1e293b' }}>Project Assistant</span>
+        <span style={{ fontSize: '0.78rem', color: isConnected ? '#10b981' : '#64748b', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '5px' }}>
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: isConnected ? '#10b981' : '#94a3b8', display: 'inline-block' }} />
+          {isConnected ? 'Real-time' : 'REST mode'}
+        </span>
+      </div>
+
       <div className="chat-messages">
         {messages.length === 0 && (
-          <div style={{ textAlign: 'center', color: '#999', paddingTop: '40px' }}>
-            <p>No messages yet. Start by asking about your project!</p>
-            <p style={{ fontSize: '0.9rem', marginTop: '10px' }}>
-              {isConnected ? '✓ Connected' : '⚠ Connecting...'}
+          <div style={{ textAlign: 'center', color: '#94a3b8', paddingTop: '60px' }}>
+            <p style={{ fontSize: '1rem', fontWeight: 500, marginBottom: '6px' }}>No messages yet</p>
+            <p style={{ fontSize: '0.85rem' }}>
+              Ask about your requirements, architecture, or quality analysis.
             </p>
           </div>
         )}
@@ -126,10 +161,10 @@ function Chatbot({ projectId, apiUrl }) {
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           placeholder="Ask about your requirements, architecture, or quality analysis..."
-          disabled={!isConnected}
+          disabled={sending}
         />
-        <button type="submit" disabled={!isConnected || !inputValue.trim()}>
-          Send
+        <button type="submit" disabled={sending || !inputValue.trim()}>
+          {sending ? 'Sending…' : 'Send'}
         </button>
       </form>
     </div>

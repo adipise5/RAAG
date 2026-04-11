@@ -15,8 +15,6 @@ function App() {
   const handleProjectSubmit = async (formData) => {
     try {
       const response = await axios.post(`${API_URL}/projects`, formData);
-      setProjectId(response.data.project_id);
-      setProjectData(formData);
       
       // Fetch analysis
       await axios.post(`${API_URL}/analyze`, {
@@ -24,6 +22,8 @@ function App() {
         requirements: formData.requirements.map(r => r.text)
       });
       
+      setProjectId(response.data.project_id);
+      setProjectData(formData);
       setCurrentPage('dashboard');
     } catch (error) {
       console.error('Error submitting project:', error);
@@ -43,7 +43,7 @@ function App() {
     <div className="app">
       <header className="app-header">
         <div className="header-content">
-          <h1>🏗️ RAAG</h1>
+          <h1>RAAG</h1>
           <p>Requirement Analysis & Architecture Generator v2.0</p>
         </div>
       </header>
@@ -74,14 +74,18 @@ function App() {
       </nav>
 
       <main className="app-main">
-        {currentPage === 'form' && (
+        <div style={{ display: currentPage === 'form' ? 'block' : 'none' }}>
           <ProjectForm onSubmit={handleProjectSubmit} />
+        </div>
+        {projectId && (
+          <div style={{ display: currentPage === 'dashboard' ? 'block' : 'none' }}>
+            <Dashboard projectId={projectId} projectData={projectData} apiUrl={API_URL} />
+          </div>
         )}
-        {currentPage === 'dashboard' && projectId && (
-          <Dashboard projectId={projectId} projectData={projectData} apiUrl={API_URL} />
-        )}
-        {currentPage === 'chatbot' && projectId && (
-          <Chatbot projectId={projectId} apiUrl={API_URL} />
+        {projectId && (
+          <div style={{ display: currentPage === 'chatbot' ? 'block' : 'none' }}>
+            <Chatbot projectId={projectId} apiUrl={API_URL} />
+          </div>
         )}
       </main>
 
