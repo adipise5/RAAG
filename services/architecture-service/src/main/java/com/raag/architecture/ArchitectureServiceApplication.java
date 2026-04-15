@@ -35,6 +35,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @SpringBootApplication
@@ -94,6 +96,7 @@ class Component {
 
 class ArchitectureRequest {
     private String projectId;
+    private String projectName;
     private String proposedStyle;
     private List<String> requirements;
     private String projectDescription;
@@ -101,6 +104,9 @@ class ArchitectureRequest {
 
     public String getProjectId() { return projectId; }
     public void setProjectId(String projectId) { this.projectId = projectId; }
+
+    public String getProjectName() { return projectName; }
+    public void setProjectName(String projectName) { this.projectName = projectName; }
 
     public String getProposedStyle() { return proposedStyle; }
     public void setProposedStyle(String proposedStyle) { this.proposedStyle = proposedStyle; }
@@ -280,6 +286,7 @@ class ArchitectureService {
         String style = arch.getStyle();
         List<Component> components = arch.getComponents();
         String domain = safe(request.getDomain(), "General");
+    String projectName = deriveProjectName(request.getProjectName(), description, request.getProjectId());
 
         // Step 2: launch all LLM-backed sections in parallel — each is bounded to 12s internally
         CompletableFuture<List<String>> justFuture = CompletableFuture.supplyAsync(
@@ -300,7 +307,7 @@ class ArchitectureService {
                 () -> generateNoveltyAssessment(description, domain, requirements));
 
         // DFD is computed locally — no LLM needed, completes immediately
-        DfdBundle dfdBundle = generateDfdBundle(description, requirements, style, components);
+    DfdBundle dfdBundle = generateDfdBundle(projectName, description, requirements, style, components, domain);
         List<String> externalEntities = extractExternalEntities(description, requirements);
         List<GeneratedDiagram> additionalDiagrams = generateAdditionalDiagrams(
                 description, requirements, style, components, externalEntities
@@ -595,19 +602,44 @@ Return JSON array.
     // MODULE 3: DFD LEVEL 0/1
     // ============================
     private DfdBundle generateDfdBundle(
+            String projectName,
             String description,
             List<String> requirements,
             String architectureStyle,
-            List<Component> components
+            List<Component> components,
+            String domain
     ) {
         List<String> externalEntities = extractExternalEntities(description, requirements);
 
-        String level0Plant = buildLevel0PlantUml(architectureStyle, externalEntities);
+        String level0Plant = generateDfdPlantUmlWithLlm(
+                0,
+                projectName,
+                description,
+                requirements,
+                architectureStyle,
+                externalEntities,
+                domain
+        );
+        if (!isValidLevel0Dfd(level0Plant, externalEntities, projectName)) {
+            level0Plant = buildLevel0PlantUml(architectureStyle, externalEntities, projectName);
+        }
+
         List<String> level0Nodes = new ArrayList<>(externalEntities);
-        level0Nodes.add("System");
-        List<String> level0Edges = externalEntities.stream()
-                .map(entity -> entity + " -> System")
-                .collect(Collectors.toCollection(ArrayList::new));
+        level0Nodes.add("P0: " + projectName + " System");
+        List<String> level0Edges = new ArrayList<>();
+        for (String entity : externalEntities) {
+            String lower = entity.toLowerCase(Locale.ROOT);
+            if (lower.contains("admin")) {
+                level0Edges.add(entity + " -> P0: Admin configuration/policies");
+                level0Edges.add("P0 -> " + entity + ": Audit/operations status + control feedback");
+            } else if (lower.contains("external") || lower.contains("gateway") || lower.contains("regulator")) {
+                level0Edges.add(entity + " -> P0: External responses/data");
+                level0Edges.add("P0 -> " + entity + ": Requests for inference/export/integration");
+            } else {
+                level0Edges.add(entity + " -> P0: Project details + requirements");
+                level0Edges.add("P0 -> " + entity + ": Analysis results + recommendations + reports");
+            }
+        }
 
         DfdLevel level0 = new DfdLevel(
                 level0Plant,
@@ -616,37 +648,289 @@ Return JSON array.
                 level0Edges
         );
 
-        Graph<String, DefaultEdge> graph = buildComponentGraph(components);
-        List<String> stores = deriveDataStores(requirements);
+        String level1Plant = generateDfdPlantUmlWithLlm(
+                1,
+                projectName,
+                description,
+                requirements,
+                architectureStyle,
+                externalEntities,
+                domain
+        );
+        if (!isValidLevel1Dfd(level1Plant, externalEntities)) {
+            level1Plant = buildLevel1FallbackPlantUml(projectName, description, requirements, externalEntities, domain);
+        }
 
-        String level1Plant = buildLevel1PlantUml(architectureStyle, graph, stores);
+        List<String> derivedProcesses = deriveLevel1Processes(description, requirements, domain);
+        List<String> derivedStores = deriveDataStores(description, requirements, domain);
 
-        List<String> level1Edges = graph.edgeSet().stream()
-                .map(edge -> graph.getEdgeSource(edge) + " -> " + graph.getEdgeTarget(edge))
-                .collect(Collectors.toCollection(ArrayList::new));
+        List<String> level1Nodes = new ArrayList<>();
+        for (int i = 0; i < derivedProcesses.size(); i++) {
+            level1Nodes.add("P" + (i + 1) + ": " + derivedProcesses.get(i));
+        }
+        for (int i = 0; i < derivedStores.size(); i++) {
+            level1Nodes.add("D" + (i + 1) + ": " + derivedStores.get(i));
+        }
+
+        List<String> level1Edges = new ArrayList<>();
+        if (!derivedProcesses.isEmpty()) {
+            level1Edges.addAll(externalEntities.stream()
+                    .map(e -> e + " -> P1")
+                    .toList());
+            for (int i = 1; i < derivedProcesses.size(); i++) {
+                level1Edges.add("P" + i + " -> P" + (i + 1));
+            }
+            for (int i = 0; i < derivedStores.size(); i++) {
+                int processIndex = Math.min(i + 1, derivedProcesses.size());
+                level1Edges.add("P" + processIndex + " -> D" + (i + 1));
+            }
+            int lastProcess = derivedProcesses.size();
+            level1Edges.addAll(externalEntities.stream()
+                    .map(e -> "P" + lastProcess + " -> " + e)
+                    .toList());
+        }
 
         DfdLevel level1 = new DfdLevel(
                 level1Plant,
                 renderSvg(level1Plant),
-                graph.vertexSet().stream().sorted().collect(Collectors.toCollection(ArrayList::new)),
+        level1Nodes,
                 level1Edges
         );
 
         return new DfdBundle(level0, level1);
     }
 
+    private String generateDfdPlantUmlWithLlm(
+            int level,
+        String projectName,
+            String description,
+            List<String> requirements,
+            String architectureStyle,
+        List<String> externalEntities,
+        String domain
+    ) {
+        String prompt = level == 0
+        ? buildDfdLevel0Prompt(projectName, description, requirements, architectureStyle, externalEntities, domain)
+        : buildDfdLevel1Prompt(projectName, description, requirements, architectureStyle, externalEntities, domain);
+
+        try {
+            Map<String, Object> response = llmClient.callCustomPrompt(prompt);
+            String plant = extractPlantUmlFromResponse(response);
+            if (isValidPlantUml(plant)) {
+                return plant;
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+
+        return null;
+    }
+
+    private boolean isValidLevel0Dfd(String plantUml, List<String> externalEntities, String projectName) {
+        if (!isValidPlantUml(plantUml)) {
+            return false;
+        }
+
+        String lower = plantUml.toLowerCase(Locale.ROOT);
+        if (lower.contains("database ") || lower.contains("datastore") || lower.contains("storage ")) {
+            return false;
+        }
+        if (Pattern.compile("\\bP[1-9]\\d*\\b", Pattern.CASE_INSENSITIVE).matcher(plantUml).find()) {
+            return false;
+        }
+        String expectedProcessLabel = "P0: " + safe(projectName, "Project") + " System";
+        if (!plantUml.contains(expectedProcessLabel)) {
+            return false;
+        }
+
+        int processCount = 0;
+        Matcher processMatcher = Pattern.compile("(?i)(rectangle|process|component)\\s+\"[^\"]*" + Pattern.quote(expectedProcessLabel) + "[^\"]*\"").matcher(plantUml);
+        while (processMatcher.find()) {
+            processCount++;
+        }
+        if (processCount != 1) {
+            return false;
+        }
+
+        for (String entity : externalEntities) {
+            String alias = alias(entity);
+            boolean hasInput = plantUml.contains(alias + " --> P0") || plantUml.contains(alias + "-> P0") || plantUml.contains(alias + "--> P0");
+            boolean hasOutput = plantUml.contains("P0 --> " + alias) || plantUml.contains("P0 -> " + alias) || plantUml.contains("P0 -->" + alias);
+            if (!(hasInput && hasOutput)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean isValidLevel1Dfd(String plantUml, List<String> externalEntities) {
+        if (!isValidPlantUml(plantUml)) {
+            return false;
+        }
+
+        Matcher processMatcher = Pattern.compile("\\bP([1-9]\\d*)\\b").matcher(plantUml);
+        Set<String> processes = new LinkedHashSet<>();
+        while (processMatcher.find()) {
+            processes.add("P" + processMatcher.group(1));
+        }
+        if (processes.size() < 2) {
+            return false;
+        }
+
+        for (String entity : externalEntities) {
+            String entityAlias = alias(entity);
+            if (!plantUml.contains(entityAlias)) {
+                return false;
+            }
+        }
+
+        Matcher edgeMatcher = Pattern.compile("([A-Za-z0-9_]+)\\s*-+>\\s*([A-Za-z0-9_]+)").matcher(plantUml);
+        Map<String, Integer> incoming = new HashMap<>();
+        Map<String, Integer> outgoing = new HashMap<>();
+        int processToProcessEdges = 0;
+
+        while (edgeMatcher.find()) {
+            String src = edgeMatcher.group(1);
+            String dst = edgeMatcher.group(2);
+            if (src.matches("P[1-9]\\d*")) {
+                outgoing.put(src, outgoing.getOrDefault(src, 0) + 1);
+            }
+            if (dst.matches("P[1-9]\\d*")) {
+                incoming.put(dst, incoming.getOrDefault(dst, 0) + 1);
+            }
+            if (src.matches("P[1-9]\\d*") && dst.matches("P[1-9]\\d*")) {
+                processToProcessEdges++;
+            }
+        }
+
+        if (processToProcessEdges == 0) {
+            return false;
+        }
+
+        int balancedProcesses = 0;
+        for (String p : processes) {
+            if (incoming.getOrDefault(p, 0) > 0 && outgoing.getOrDefault(p, 0) > 0) {
+                balancedProcesses++;
+            }
+        }
+
+        return balancedProcesses >= Math.max(2, processes.size() - 1);
+    }
+
+    private String buildDfdLevel0Prompt(
+            String projectName,
+            String description,
+            List<String> requirements,
+            String architectureStyle,
+            List<String> externalEntities,
+            String domain
+    ) {
+        return String.format("""
+You are a professional System Analyst.
+Generate Level 0 DFD in PlantUML based ONLY on the user's project idea.
+
+Project Name:
+%s
+
+Project Description:
+%s
+
+Domain:
+%s
+
+Requirements:
+%s
+
+Architecture Style (context only):
+%s
+
+External Entities (seed list, refine if needed):
+%s
+
+STRICT RULES (must follow exactly):
+1) Represent the whole system as ONE SINGLE process only.
+2) Show ONLY external entities and input/output data flows.
+3) Do NOT add internal subprocesses.
+4) Do NOT add data stores.
+5) Keep it high-level and abstract.
+6) Name the main process exactly: "P0: %s System".
+7) Do NOT include AI, RAAG internals, backend APIs, microservices, queues, or technical components.
+8) Use real domain entities from project description.
+
+Return only JSON:
+{"plantuml_code":"@startuml ... @enduml"}
+
+PlantUML must start with @startuml and end with @enduml.
+""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"));
+    }
+
+    private String buildDfdLevel1Prompt(
+            String projectName,
+            String description,
+            List<String> requirements,
+            String architectureStyle,
+            List<String> externalEntities,
+            String domain
+    ) {
+        return String.format("""
+You are a professional System Analyst.
+Generate Level 1 DFD in PlantUML by decomposing P0 for the same user project.
+
+Project Name:
+%s
+
+Project Description:
+%s
+
+Domain:
+%s
+
+Requirements:
+%s
+
+Architecture Style (context only):
+%s
+
+External Entities to stay consistent with Level 0:
+%s
+
+STRICT RULES (must follow exactly):
+1) Decompose P0: %s System into 4-6 meaningful domain-specific subprocesses (P1, P2, ...).
+2) Each subprocess must show inputs and outputs.
+3) Include data stores (D1, D2...) only when applicable.
+4) Show proper data flow between subprocesses, external entities, and data stores.
+5) Maintain consistency with Level 0 external entities.
+6) Keep names practical and derived from user project context.
+7) Do NOT include AI, RAAG internals, backend APIs, microservices, queues, or technical components.
+8) Avoid duplicate flows and keep the diagram readable.
+
+Return only JSON:
+{"plantuml_code":"@startuml ... @enduml"}
+
+PlantUML must start with @startuml and end with @enduml.
+""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"));
+    }
+
     private List<String> extractExternalEntities(String description, List<String> requirements) {
         String text = (safe(description, "") + " " + String.join(" ", requirements)).toLowerCase(Locale.ROOT);
         Set<String> entities = new LinkedHashSet<>();
 
-        if (text.contains("admin")) entities.add("Admin");
-        if (text.contains("user") || text.contains("customer") || text.contains("client")) entities.add("End User");
-        if (text.contains("payment") || text.contains("billing")) entities.add("Payment Gateway");
-        if (text.contains("third-party") || text.contains("external")) entities.add("External Service");
-        if (text.contains("compliance") || text.contains("regulatory") || text.contains("audit")) entities.add("Regulator");
+        if (containsAny(text, "student")) entities.add("Student");
+        if (containsAny(text, "passenger")) entities.add("Passenger");
+        if (containsAny(text, "patient")) entities.add("Patient");
+        if (containsAny(text, "teacher", "faculty")) entities.add("Teacher");
+        if (containsAny(text, "doctor")) entities.add("Doctor");
+        if (containsAny(text, "admin", "administrator")) entities.add("Admin");
+        if (containsAny(text, "user", "customer", "client")) entities.add("Project User");
+        if (containsAny(text, "payment", "billing")) entities.add("Payment Gateway");
+        if (containsAny(text, "government", "regulator", "compliance", "audit")) entities.add("Regulator");
+        if (containsAny(text, "external", "third-party", "integration", "api")) entities.add("External Services");
 
         if (entities.isEmpty()) {
-            entities.add("End User");
+            entities.add("Project User");
+            entities.add("Admin");
+            entities.add("External Services");
         }
 
         return new ArrayList<>(entities);
@@ -686,27 +970,49 @@ Return JSON array.
         return graph;
     }
 
-    private List<String> deriveDataStores(List<String> requirements) {
-        String text = String.join(" ", requirements).toLowerCase(Locale.ROOT);
+    private List<String> deriveDataStores(String description, List<String> requirements, String domain) {
+        String text = (safe(description, "") + " " + String.join(" ", requirements) + " " + safe(domain, "")).toLowerCase(Locale.ROOT);
         Set<String> stores = new LinkedHashSet<>();
 
-        stores.add("Requirements Store");
-        stores.add("Architecture Store");
+        if (containsAny(text, "health", "patient", "doctor", "clinic", "hospital", "ehr", "medical")) {
+            stores.add("Patient Records DB");
+            stores.add("Appointments DB");
+            if (containsAny(text, "billing", "payment", "insurance")) stores.add("Billing DB");
+            if (containsAny(text, "audit", "compliance", "hipaa")) stores.add("Compliance Audit DB");
+        } else if (containsAny(text, "e-commerce", "ecommerce", "order", "product", "cart", "seller")) {
+            stores.add("Customer DB");
+            stores.add("Product Catalog DB");
+            stores.add("Order DB");
+            if (containsAny(text, "payment", "invoice", "billing")) stores.add("Payment DB");
+        } else if (containsAny(text, "bank", "banking", "account", "transaction", "loan")) {
+            stores.add("Customer Accounts DB");
+            stores.add("Transactions DB");
+            if (containsAny(text, "loan", "credit")) stores.add("Loans DB");
+            stores.add("Compliance Audit DB");
+        } else if (containsAny(text, "education", "school", "university", "student", "course", "teacher", "grade")) {
+            stores.add("Student DB");
+            stores.add("Course Catalog DB");
+            stores.add("Enrollment DB");
+            if (containsAny(text, "grade", "exam", "result")) stores.add("Grades DB");
+        } else if (containsAny(text, "transport", "ticket", "passenger", "trip", "ride", "fare")) {
+            stores.add("Passenger DB");
+            stores.add("Booking DB");
+            stores.add("Trip Schedule DB");
+            if (containsAny(text, "fare", "payment", "billing")) stores.add("Fare Transactions DB");
+        } else {
+            stores.add("User DB");
+            stores.add("Transactions DB");
+            stores.add("Reports DB");
+        }
 
-        if (text.contains("user") || text.contains("auth") || text.contains("login")) {
-            stores.add("Identity Store");
-        }
-        if (text.contains("audit") || text.contains("compliance")) {
-            stores.add("Audit Log Store");
-        }
-        if (text.contains("event") || text.contains("stream")) {
-            stores.add("Event Store");
+        if (containsAny(text, "audit", "compliance", "log") && stores.stream().noneMatch(s -> s.toLowerCase(Locale.ROOT).contains("audit"))) {
+            stores.add("Audit Log DB");
         }
 
         return new ArrayList<>(stores);
     }
 
-    private String buildLevel0PlantUml(String architectureStyle, List<String> externalEntities) {
+    private String buildLevel0PlantUml(String architectureStyle, List<String> externalEntities, String projectName) {
         StringBuilder sb = new StringBuilder();
         sb.append("@startuml\n");
         sb.append("left to right direction\n");
@@ -717,18 +1023,138 @@ Return JSON array.
             sb.append("actor \"").append(escapePlant(entity)).append("\" as ").append(alias(entity)).append("\n");
         }
 
-        sb.append("rectangle \"RAAG System (")
-                .append(escapePlant(safe(architectureStyle, "Architecture")))
-                .append(")\" as CoreSystem\n");
+    sb.append("rectangle \"P0: ").append(escapePlant(projectName)).append(" System\" as P0\n");
 
         for (String entity : externalEntities) {
-            String entityAlias = alias(entity);
-            sb.append(entityAlias).append(" --> CoreSystem : request\n");
-            sb.append("CoreSystem --> ").append(entityAlias).append(" : response\n");
+            String a = alias(entity);
+            String lower = entity.toLowerCase(Locale.ROOT);
+            if (lower.contains("admin")) {
+                sb.append(a).append(" --> P0 : Admin configuration/policies\n");
+                sb.append("P0 --> ").append(a).append(" : Audit/operations status + control feedback\n");
+            } else if (lower.contains("external") || lower.contains("gateway") || lower.contains("regulator")) {
+                sb.append(a).append(" --> P0 : External responses/data\n");
+                sb.append("P0 --> ").append(a).append(" : Requests for inference/export/integration\n");
+            } else {
+                sb.append(a).append(" --> P0 : Project details + requirements\n");
+                sb.append("P0 --> ").append(a).append(" : Analysis results + recommendations + reports\n");
+            }
         }
 
         sb.append("@enduml\n");
         return sb.toString();
+    }
+
+    private String buildLevel1FallbackPlantUml(
+            String projectName,
+            String description,
+            List<String> requirements,
+            List<String> externalEntities,
+            String domain
+    ) {
+        List<String> processes = deriveLevel1Processes(description, requirements, domain);
+        List<String> stores = deriveDataStores(description, requirements, domain);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("@startuml\n");
+        sb.append("left to right direction\n");
+        sb.append("skinparam shadowing false\n");
+        sb.append("skinparam componentStyle rectangle\n");
+    sb.append("title ").append(escapePlant(projectName)).append(" DFD Level 1 - Functional Decomposition\n");
+
+        for (String entity : externalEntities) {
+            sb.append("actor \"").append(escapePlant(entity)).append("\" as ").append(alias(entity)).append("\n");
+        }
+
+        int pi = 1;
+        List<String> processAliases = new ArrayList<>();
+        for (String process : processes) {
+            String processId = "P" + pi;
+            sb.append("rectangle \"").append(processId).append(": ").append(escapePlant(process)).append("\" as ").append(processId).append("\n");
+            processAliases.add(processId);
+            pi++;
+        }
+
+        int di = 1;
+        List<String> storeAliases = new ArrayList<>();
+        for (String store : stores) {
+            String storeId = "D" + di;
+            sb.append("database \"").append(storeId).append(": ").append(escapePlant(store)).append("\" as ").append(storeId).append("\n");
+            storeAliases.add(storeId);
+            di++;
+        }
+
+        if (!processAliases.isEmpty()) {
+            String first = processAliases.get(0);
+            String last = processAliases.get(processAliases.size() - 1);
+
+            for (String entity : externalEntities) {
+                String a = alias(entity);
+                String lower = entity.toLowerCase(Locale.ROOT);
+                if (lower.contains("admin")) {
+                    sb.append(a).append(" --> ").append(last).append(" : monitoring/control request\n");
+                    sb.append(last).append(" --> ").append(a).append(" : status/feedback\n");
+                } else {
+                    sb.append(a).append(" --> ").append(first).append(" : input/request\n");
+                    sb.append(last).append(" --> ").append(a).append(" : output/response\n");
+                }
+            }
+
+            for (int i = 0; i < processAliases.size() - 1; i++) {
+                sb.append(processAliases.get(i)).append(" --> ").append(processAliases.get(i + 1)).append(" : data flow\n");
+            }
+
+            for (int i = 0; i < storeAliases.size(); i++) {
+                String p = processAliases.get(Math.min(i, processAliases.size() - 1));
+                sb.append(p).append(" --> ").append(storeAliases.get(i)).append(" : read/write\n");
+            }
+        }
+
+        sb.append("@enduml\n");
+        return sb.toString();
+    }
+
+    private List<String> deriveLevel1Processes(String description, List<String> requirements, String domain) {
+        String text = (safe(description, "") + " " + String.join(" ", requirements) + " " + safe(domain, "")).toLowerCase(Locale.ROOT);
+        List<String> processes = new ArrayList<>();
+
+        if (containsAny(text, "health", "patient", "doctor", "clinic", "hospital", "ehr", "medical")) {
+            processes.add("Patient Management");
+            processes.add("Appointment Scheduling");
+            processes.add("Medical Records Handling");
+            if (containsAny(text, "message", "communication", "notify")) processes.add("Patient Communication");
+            if (containsAny(text, "billing", "payment", "insurance")) processes.add("Billing and Payments");
+        } else if (containsAny(text, "e-commerce", "ecommerce", "order", "product", "cart", "seller")) {
+            processes.add("Customer Account Management");
+            processes.add("Catalog Management");
+            processes.add("Order Processing");
+            if (containsAny(text, "payment", "checkout", "invoice")) processes.add("Payment Processing");
+            if (containsAny(text, "delivery", "shipping")) processes.add("Delivery Coordination");
+        } else if (containsAny(text, "bank", "banking", "account", "transaction", "loan")) {
+            processes.add("Customer Onboarding");
+            processes.add("Account Management");
+            processes.add("Transaction Processing");
+            if (containsAny(text, "loan", "credit")) processes.add("Loan Management");
+            processes.add("Compliance and Reporting");
+        } else if (containsAny(text, "education", "school", "university", "student", "course", "teacher", "grade")) {
+            processes.add("Student Registration");
+            processes.add("Course Enrollment");
+            processes.add("Class and Schedule Management");
+            if (containsAny(text, "grade", "exam", "result")) processes.add("Assessment and Grading");
+            if (containsAny(text, "report", "transcript")) processes.add("Academic Reporting");
+        } else if (containsAny(text, "transport", "ticket", "passenger", "trip", "ride", "fare")) {
+            processes.add("Passenger Registration");
+            processes.add("Ticket Booking");
+            processes.add("Trip Scheduling and Tracking");
+            if (containsAny(text, "payment", "fare", "billing")) processes.add("Fare Payment Processing");
+            if (containsAny(text, "compliance", "regulator", "audit")) processes.add("Regulatory Reporting");
+        } else {
+            processes.add("User Management");
+            processes.add("Core Service Processing");
+            processes.add("Transaction Handling");
+            processes.add("Reporting and Notifications");
+        }
+
+        return processes.stream().distinct().limit(6).toList();
     }
 
     private String buildLevel1PlantUml(String style, Graph<String, DefaultEdge> graph, List<String> stores) {
@@ -738,29 +1164,57 @@ Return JSON array.
         sb.append("skinparam shadowing false\n");
         sb.append("skinparam componentStyle rectangle\n");
 
-        sb.append("title RAAG DFD Level 1 - ").append(escapePlant(safe(style, "Architecture"))).append("\n");
+        sb.append("title RAAG DFD Level 1 - Functional Decomposition\n");
 
-        List<String> vertices = graph.vertexSet().stream().sorted().toList();
-        for (String vertex : vertices) {
-            sb.append("component \"").append(escapePlant(vertex)).append("\" as ").append(alias(vertex)).append("\n");
-        }
+        sb.append("actor \"Project User\" as E_USER\n");
+        sb.append("actor \"Admin\" as E_ADMIN\n");
+        sb.append("actor \"External Services\" as E_EXT\n");
 
-        for (String store : stores) {
-            sb.append("database \"").append(escapePlant(store)).append("\" as ").append(alias(store)).append("\n");
-        }
+        sb.append("rectangle \"P1: Capture Project Input\" as P1\n");
+        sb.append("rectangle \"P2: Classify & Score Requirements\" as P2\n");
+        sb.append("rectangle \"P3: Generate Architecture & DFD Suggestions\" as P3\n");
+        sb.append("rectangle \"P4: Build Dashboard/Chat Responses\" as P4\n");
+        sb.append("rectangle \"P5: Export Report\" as P5\n");
+        sb.append("rectangle \"P6: Record Audit Trail\" as P6\n");
 
-        for (DefaultEdge edge : graph.edgeSet()) {
-            String source = graph.getEdgeSource(edge);
-            String target = graph.getEdgeTarget(edge);
-            sb.append(alias(source)).append(" --> ").append(alias(target)).append("\n");
-        }
+        sb.append("database \"D1: Project Repository\" as D1\n");
+        sb.append("database \"D2: Analysis Repository\" as D2\n");
+        sb.append("database \"D3: Audit Log Store\" as D3\n");
 
-        for (String store : stores) {
-            String writer = chooseWriterForStore(store, vertices);
-            if (writer != null) {
-                sb.append(alias(writer)).append(" --> ").append(alias(store)).append(" : read/write\n");
-            }
-        }
+        sb.append("E_USER --> P1 : project metadata + requirements\n");
+        sb.append("P1 --> D1 : save project\n");
+        sb.append("P1 --> P2 : normalized requirements\n");
+
+        sb.append("P2 --> E_EXT : inference request\n");
+        sb.append("E_EXT --> P2 : inference response\n");
+        sb.append("P2 --> D2 : classification + quality scores\n");
+        sb.append("P2 --> P3 : classified requirements + constraints\n");
+
+        sb.append("P3 --> E_EXT : architecture generation request\n");
+        sb.append("E_EXT --> P3 : architecture generation response\n");
+        sb.append("P3 --> D2 : architecture recommendation artifacts\n");
+
+        sb.append("D1 --> P4 : project data\n");
+        sb.append("D2 --> P4 : analysis data\n");
+        sb.append("P4 --> E_USER : dashboard/chat response\n");
+
+        sb.append("D1 --> P5 : export project dataset\n");
+        sb.append("D2 --> P5 : export analysis dataset\n");
+        sb.append("P5 --> E_EXT : render/export request\n");
+        sb.append("E_EXT --> P5 : render/export response\n");
+        sb.append("P5 --> E_USER : downloadable report\n");
+
+        sb.append("P1 --> P6 : audit events\n");
+        sb.append("P2 --> P6 : audit events\n");
+        sb.append("P3 --> P6 : audit events\n");
+        sb.append("P4 --> P6 : audit events\n");
+        sb.append("P5 --> P6 : audit events\n");
+        sb.append("P6 --> D3 : immutable audit record\n");
+
+        sb.append("E_ADMIN --> P4 : monitoring request\n");
+        sb.append("P4 --> E_ADMIN : monitoring response\n");
+        sb.append("E_ADMIN --> P6 : audit control request\n");
+        sb.append("P6 --> E_ADMIN : audit status\n");
 
         sb.append("@enduml\n");
         return sb.toString();
@@ -815,156 +1269,64 @@ Return JSON array.
     // MODULE 4: TRACEABILITY MATRIX
     // ============================
     private TraceabilityMatrixResult generateTraceabilityMatrix(List<String> requirements, List<Component> components) {
-        List<String> componentNames = components.stream().map(Component::getName).toList();
-        Map<String, Object> response = llmClient.analyzeTraceability(requirements, componentNames);
-
-        List<Map<String, Object>> matrixRows = llmClient.readListOfMaps(response.get("matrix"));
-        List<TraceabilityEntry> matrix = new ArrayList<>();
-
-        for (Map<String, Object> row : matrixRows) {
-            String requirement = safe(row.get("requirement"), "");
-            if (requirement.isBlank()) {
-                continue;
-            }
-            List<String> mappedComponents = stringList(row.get("components"));
-            matrix.add(new TraceabilityEntry(requirement, mappedComponents));
-        }
-
-        if (matrix.isEmpty()) {
-            return fallbackTraceability(requirements, componentNames);
-        }
-
-        List<String> untraced = stringList(response.get("untraced_requirements"));
-        List<Map<String, Object>> densityRows = llmClient.readListOfMaps(response.get("high_density_components"));
-
-        List<HighDensityComponent> highDensity = new ArrayList<>();
-        for (Map<String, Object> row : densityRows) {
-            String component = safe(row.get("component"), "");
-            if (component.isBlank()) {
-                continue;
-            }
-            highDensity.add(new HighDensityComponent(component, intValue(row.get("requirement_count"), 0)));
-        }
-
-        return new TraceabilityMatrixResult(matrix, untraced, highDensity);
+        return fallbackTraceability(requirements, List.of());
     }
 
     private TraceabilityMatrixResult fallbackTraceability(List<String> requirements, List<String> componentNames) {
+        List<String> canonicalComponents = List.of(
+                "API Gateway",
+                "Ingestion + LLM Analysis",
+                "Quality + Architecture Services",
+                "Frontend Dashboard & Chat UI",
+                "Export Service",
+                "Audit Service"
+        );
+
         List<TraceabilityEntry> matrix = new ArrayList<>();
         Map<String, Integer> coverage = new HashMap<>();
 
-        for (String component : componentNames) {
+        for (String component : canonicalComponents) {
             coverage.put(component, 0);
         }
-
-        // Domain-aware keyword mapping: requirement keywords -> component keywords
-        Map<String, List<String>> domainHints = Map.ofEntries(
-                Map.entry("auth", List.of("auth", "gateway", "identity", "user")),
-                Map.entry("login", List.of("auth", "gateway", "identity", "user")),
-                Map.entry("password", List.of("auth", "identity", "user")),
-                Map.entry("register", List.of("auth", "user", "gateway")),
-                Map.entry("session", List.of("auth", "gateway")),
-                Map.entry("token", List.of("auth", "gateway")),
-                Map.entry("role", List.of("auth", "identity")),
-                Map.entry("permission", List.of("auth", "identity")),
-                Map.entry("encrypt", List.of("auth", "gateway", "service")),
-                Map.entry("security", List.of("auth", "gateway", "audit")),
-                Map.entry("user", List.of("user", "auth", "gateway")),
-                Map.entry("patient", List.of("user", "service", "requirement")),
-                Map.entry("customer", List.of("user", "service", "requirement")),
-                Map.entry("store", List.of("service", "data", "requirement")),
-                Map.entry("database", List.of("service", "data", "requirement")),
-                Map.entry("persist", List.of("service", "data", "requirement")),
-                Map.entry("save", List.of("service", "data", "requirement")),
-                Map.entry("record", List.of("service", "data", "requirement", "audit")),
-                Map.entry("retrieve", List.of("service", "query", "requirement")),
-                Map.entry("search", List.of("service", "query", "requirement", "analysis")),
-                Map.entry("filter", List.of("service", "query", "analysis")),
-                Map.entry("report", List.of("reporting", "analysis", "architecture", "service")),
-                Map.entry("dashboard", List.of("reporting", "analysis", "service")),
-                Map.entry("display", List.of("reporting", "service", "gateway")),
-                Map.entry("view", List.of("reporting", "query", "service")),
-                Map.entry("monitor", List.of("audit", "reporting", "service")),
-                Map.entry("notify", List.of("notification", "worker", "event")),
-                Map.entry("alert", List.of("notification", "worker", "event")),
-                Map.entry("email", List.of("notification", "worker")),
-                Map.entry("sms", List.of("notification", "worker")),
-                Map.entry("payment", List.of("payment", "billing", "gateway")),
-                Map.entry("billing", List.of("payment", "billing", "gateway")),
-                Map.entry("invoice", List.of("payment", "billing", "service")),
-                Map.entry("audit", List.of("audit", "compliance", "service")),
-                Map.entry("compliance", List.of("audit", "compliance", "service")),
-                Map.entry("log", List.of("audit", "gateway", "service")),
-                Map.entry("track", List.of("audit", "service", "analysis")),
-                Map.entry("api", List.of("gateway", "api")),
-                Map.entry("endpoint", List.of("gateway", "api", "service")),
-                Map.entry("request", List.of("gateway", "service", "command")),
-                Map.entry("response", List.of("gateway", "service")),
-                Map.entry("analyze", List.of("analysis", "architecture", "service")),
-                Map.entry("analysis", List.of("analysis", "architecture", "service")),
-                Map.entry("process", List.of("service", "worker", "command")),
-                Map.entry("generate", List.of("architecture", "service", "function")),
-                Map.entry("export", List.of("reporting", "service")),
-                Map.entry("import", List.of("service", "requirement", "gateway")),
-                Map.entry("upload", List.of("service", "gateway", "requirement")),
-                Map.entry("download", List.of("service", "gateway", "reporting")),
-                Map.entry("performance", List.of("gateway", "service", "architecture")),
-                Map.entry("scalab", List.of("gateway", "architecture", "service")),
-                Map.entry("availab", List.of("gateway", "architecture", "service")),
-                Map.entry("reliab", List.of("gateway", "architecture", "service")),
-                Map.entry("backup", List.of("service", "data", "architecture")),
-                Map.entry("recover", List.of("service", "data", "architecture")),
-                Map.entry("event", List.of("event", "bus", "worker", "projection")),
-                Map.entry("real-time", List.of("event", "bus", "worker", "notification")),
-                Map.entry("message", List.of("event", "bus", "notification", "worker")),
-                Map.entry("queue", List.of("event", "bus", "worker")),
-                Map.entry("chat", List.of("chatbot", "service", "gateway")),
-                Map.entry("schedule", List.of("service", "worker", "function")),
-                Map.entry("config", List.of("gateway", "service", "architecture")),
-                Map.entry("integrat", List.of("gateway", "service", "architecture"))
-        );
 
         for (String requirement : requirements) {
             String lower = requirement.toLowerCase(Locale.ROOT);
             Set<String> mapped = new LinkedHashSet<>();
 
-            // Strategy 1: domain-aware keyword matching
-            for (Map.Entry<String, List<String>> entry : domainHints.entrySet()) {
-                if (lower.contains(entry.getKey())) {
-                    for (String hint : entry.getValue()) {
-                        componentNames.stream()
-                                .filter(c -> c.toLowerCase(Locale.ROOT).contains(hint))
-                                .forEach(mapped::add);
-                    }
-                }
+            // Core ingress always goes through API gateway
+            mapped.add("API Gateway");
+
+            if (containsAny(lower, "register", "login", "otp", "authenticate", "authorize", "rbac", "role", "permission")) {
+                mapped.add("Ingestion + LLM Analysis");
+                mapped.add("Quality + Architecture Services");
             }
 
-            // Strategy 2: direct token matching (original logic)
-            if (mapped.isEmpty()) {
-                componentNames.stream()
-                        .filter(component -> {
-                            String[] tokens = component.toLowerCase(Locale.ROOT).split("[^a-z0-9]+");
-                            for (String token : tokens) {
-                                if (token.length() > 2 && lower.contains(token)) {
-                                    return true;
-                                }
-                            }
-                            return false;
-                        })
-                        .forEach(mapped::add);
+            if (containsAny(lower, "requirement", "analysis", "classif", "quality", "architecture", "dfd", "fhir", "integration")) {
+                mapped.add("Ingestion + LLM Analysis");
+                mapped.add("Quality + Architecture Services");
             }
 
-            // Strategy 3: assign to gateway + first service as last resort
-            if (mapped.isEmpty()) {
-                componentNames.stream()
-                        .filter(c -> c.toLowerCase(Locale.ROOT).contains("gateway"))
-                        .findFirst().ifPresent(mapped::add);
-                componentNames.stream()
-                        .filter(c -> {
-                            String l = c.toLowerCase(Locale.ROOT);
-                            return l.contains("requirement") || l.contains("main") || l.contains("application");
-                        })
-                        .findFirst().ifPresent(mapped::add);
+            if (containsAny(lower, "dashboard", "chat", "view", "display", "doctor", "patient", "schedule")) {
+                mapped.add("Frontend Dashboard & Chat UI");
+            }
+
+            if (containsAny(lower, "report", "pdf", "csv", "export", "download")) {
+                mapped.add("Export Service");
+            }
+
+            if (containsAny(lower, "audit", "compliance", "hipaa", "pci", "log", "immutable", "security", "encryption")) {
+                mapped.add("Audit Service");
+                mapped.add("Quality + Architecture Services");
+            }
+
+            if (containsAny(lower, "payment", "billing", "invoice")) {
+                mapped.add("Ingestion + LLM Analysis");
+                mapped.add("Quality + Architecture Services");
+            }
+
+            if (containsAny(lower, "uptime", "reliab", "recover", "backup", "availability", "performance")) {
+                mapped.add("Quality + Architecture Services");
+                mapped.add("Audit Service");
             }
 
             List<String> mappedList = new ArrayList<>(mapped);
@@ -988,6 +1350,15 @@ Return JSON array.
                 .toList();
 
         return new TraceabilityMatrixResult(matrix, untraced, highDensity);
+    }
+
+    private boolean containsAny(String text, String... needles) {
+        for (String needle : needles) {
+            if (text.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ============================
@@ -1502,6 +1873,37 @@ Return JSON array.
         return "- " + String.join("\n- ", requirements);
     }
 
+    private String deriveProjectName(String incomingProjectName, String description, String projectId) {
+        String candidate = safe(incomingProjectName, "");
+        if (!candidate.isBlank()) {
+            return candidate;
+        }
+
+        String fromDescription = safe(description, "").trim();
+        if (!fromDescription.isBlank()) {
+            String[] tokens = fromDescription.split("\\s+");
+            StringBuilder sb = new StringBuilder();
+            int count = 0;
+            for (String t : tokens) {
+                String cleaned = t.replaceAll("[^A-Za-z0-9]", "");
+                if (cleaned.isBlank()) continue;
+                if (count > 0) sb.append(" ");
+                sb.append(cleaned.substring(0, 1).toUpperCase(Locale.ROOT)).append(cleaned.substring(1));
+                count++;
+                if (count == 3) break;
+            }
+            if (!sb.isEmpty()) {
+                return sb.toString();
+            }
+        }
+
+        String id = safe(projectId, "Project");
+        if (id.length() > 12) {
+            id = id.substring(0, 12);
+        }
+        return "Project " + id;
+    }
+
     private String extractResultString(Map<String, Object> response) {
         try {
             Object result = response.get("result");
@@ -1518,6 +1920,77 @@ Return JSON array.
             return null;
         }
         return null;
+    }
+
+    private String extractPlantUmlFromResponse(Map<String, Object> response) {
+        if (response == null || response.isEmpty()) {
+            return null;
+        }
+
+        Object direct = response.get("plantuml_code");
+        if (direct instanceof String s && isValidPlantUml(s)) {
+            return s.trim();
+        }
+
+        Object result = response.get("result");
+        if (result instanceof Map<?, ?> map) {
+            Object code = map.get("plantuml_code");
+            if (code instanceof String s && isValidPlantUml(s)) {
+                return s.trim();
+            }
+            Object nestedResult = map.get("result");
+            if (nestedResult instanceof String s) {
+                String extracted = extractPlantUmlFromText(s);
+                if (isValidPlantUml(extracted)) {
+                    return extracted;
+                }
+            }
+        }
+
+        if (result instanceof String textResult) {
+            String extracted = extractPlantUmlFromText(textResult);
+            if (isValidPlantUml(extracted)) {
+                return extracted;
+            }
+        }
+
+        String fallbackText = extractResultString(response);
+        return extractPlantUmlFromText(fallbackText);
+    }
+
+    private String extractPlantUmlFromText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+
+        String trimmed = raw.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> parsed = objectMapper.readValue(trimmed, Map.class);
+                String code = safe(parsed.get("plantuml_code"), "");
+                if (isValidPlantUml(code)) {
+                    return code;
+                }
+            } catch (Exception ignored) {
+                // fall through to regex extraction
+            }
+        }
+
+        Matcher matcher = Pattern.compile("(@startuml[\\s\\S]*?@enduml)", Pattern.CASE_INSENSITIVE).matcher(trimmed);
+        if (matcher.find()) {
+            return matcher.group(1).trim();
+        }
+
+        return null;
+    }
+
+    private boolean isValidPlantUml(String plantUml) {
+        if (plantUml == null || plantUml.isBlank()) {
+            return false;
+        }
+        String lower = plantUml.toLowerCase(Locale.ROOT);
+        return lower.contains("@startuml") && lower.contains("@enduml");
     }
 
     private List<String> extractResultList(Map<String, Object> response, List<String> fallback) {

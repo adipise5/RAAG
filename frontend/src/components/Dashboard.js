@@ -1,10 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 
 function Dashboard({ projectId, projectData, apiUrl }) {
   const [analysis, setAnalysis] = useState(null);
   const [architecture, setArchitecture] = useState(null);
-  const [quality, setQuality] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [exportLoading, setExportLoading] = useState(false);
@@ -15,11 +14,7 @@ function Dashboard({ projectId, projectData, apiUrl }) {
   const [diagramLoading, setDiagramLoading] = useState(false);
   const [generatedSvg, setGeneratedSvg] = useState('');
 
-  useEffect(() => {
-    fetchAnalysisData();
-  }, [projectId]);
-
-  const fetchAnalysisData = async () => {
+  const fetchAnalysisData = useCallback(async () => {
     try {
       setLoading(true);
 
@@ -31,6 +26,7 @@ function Dashboard({ projectId, projectData, apiUrl }) {
       try {
         const archRes = await axios.post(`${apiUrl}/generate-architecture`, {
           projectId,
+          projectName: projectData?.name || '',
           proposedStyle: projectData?.proposed_architecture || 'Microservices',
           requirements: projectData?.requirements?.map(r => r.text) || [],
           projectDescription: projectData?.description || '',
@@ -48,7 +44,11 @@ function Dashboard({ projectId, projectData, apiUrl }) {
     } finally {
       setLoading(false);
     }
-  };
+  }, [apiUrl, projectData, projectId]);
+
+  useEffect(() => {
+    fetchAnalysisData();
+  }, [fetchAnalysisData]);
 
   const handleExportPDF = async () => {
     try {
@@ -95,6 +95,20 @@ function Dashboard({ projectId, projectData, apiUrl }) {
       setDiagramLoading(false);
     }
   };
+
+  const rtmRows = architecture?.traceabilityMatrix?.matrix || [];
+  const canonicalComponents = [
+    'API Gateway',
+    'Ingestion + LLM Analysis',
+    'Quality + Architecture Services',
+    'Frontend Dashboard & Chat UI',
+    'Export Service',
+    'Audit Service'
+  ];
+  const rtmComponents = canonicalComponents.filter((comp) =>
+    rtmRows.some((row) => (row.components || []).includes(comp))
+  );
+  const visibleRtmComponents = rtmComponents.length > 0 ? rtmComponents : canonicalComponents;
 
   if (loading) {
     return (
@@ -449,28 +463,45 @@ function Dashboard({ projectId, projectData, apiUrl }) {
           {architecture.traceabilityMatrix && architecture.traceabilityMatrix.matrix?.length > 0 && (
             <div style={{ marginTop: '24px' }}>
               <h3 style={{ marginBottom: '14px', fontSize: '1rem', fontWeight: 600, color: '#1e293b' }}>Traceability Matrix</h3>
-              <table className="classification-table">
-                <thead>
-                  <tr>
-                    <th>Requirement</th>
-                    <th>Mapped Components</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {architecture.traceabilityMatrix.matrix.map((row, idx) => (
-                    <tr key={idx}>
-                      <td className="requirement-cell" style={{ fontSize: '0.83rem' }}>{row.requirement}</td>
-                      <td>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                          {row.components?.length > 0 ? row.components.map((comp, i) => (
-                            <span key={i} style={{ fontSize: '0.72rem', padding: '2px 8px', borderRadius: '10px', background: '#e0e7ff', color: '#3730a3' }}>{comp}</span>
-                          )) : <span style={{ color: '#ef4444', fontSize: '0.78rem', fontWeight: 500 }}>Untraced</span>}
-                        </div>
-                      </td>
+              <div style={{ overflowX: 'auto', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '0', background: '#fff' }}>
+                <table className="classification-table" style={{ marginTop: 0, border: 'none' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ minWidth: '90px' }}>Requirement</th>
+                      {visibleRtmComponents.map((comp, idx) => (
+                        <th key={`rtm-comp-head-${idx}`} style={{ minWidth: '180px' }}>{comp}</th>
+                      ))}
                     </tr>
+                  </thead>
+                  <tbody>
+                    {rtmRows.map((row, rIdx) => (
+                      <tr key={`rtm-row-${rIdx}`}>
+                        <td style={{ fontWeight: 600 }}>R{rIdx + 1}</td>
+                        {visibleRtmComponents.map((comp, cIdx) => (
+                          <td key={`rtm-cell-${rIdx}-${cIdx}`} style={{ textAlign: 'center', fontWeight: 700 }}>
+                            {(row.components || []).includes(comp) ? 'X' : ''}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div style={{ marginTop: '10px', padding: '10px 12px', background: '#f8fafc', border: '1px solid #e5e7eb', borderRadius: '8px' }}>
+                <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#374151', marginBottom: '6px' }}>Legend</div>
+                <div style={{ fontSize: '0.78rem', color: '#4b5563', marginBottom: '6px' }}>
+                  {rtmRows.map((row, idx) => (
+                    <div key={`req-legend-${idx}`}>R{idx + 1}: {row.requirement}</div>
                   ))}
-                </tbody>
-              </table>
+                </div>
+                <div style={{ fontSize: '0.78rem', color: '#4b5563' }}>
+                  {visibleRtmComponents.map((comp, idx) => (
+                    <div key={`comp-legend-${idx}`}>{comp}</div>
+                  ))}
+                </div>
+              </div>
+
               {architecture.traceabilityMatrix.untraced_requirements?.length > 0 && (
                 <div style={{ marginTop: '10px', padding: '10px 14px', background: '#fef2f2', borderRadius: '8px', border: '1px solid #fecaca' }}>
                   <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#dc2626' }}>
@@ -506,7 +537,7 @@ function Dashboard({ projectId, projectData, apiUrl }) {
               )}
               {architecture.dfd.level_1?.svg && (
                 <div>
-                  <h4 style={{ marginBottom: '10px', color: '#64748b', fontSize: '0.88rem', fontWeight: 600 }}>Level 1 — Component Flow</h4>
+                  <h4 style={{ marginBottom: '10px', color: '#64748b', fontSize: '0.88rem', fontWeight: 600 }}>Level 1 — Functional Decomposition</h4>
                   <div
                     style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '10px', padding: '16px', background: '#fff' }}
                     dangerouslySetInnerHTML={{ __html: architecture.dfd.level_1.svg }}

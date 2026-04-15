@@ -44,7 +44,7 @@ function App() {
       <header className="app-header">
         <div className="header-content">
           <h1>RAAG</h1>
-          <p>Requirement Analysis & Architecture Generator v2.0</p>
+          <p>Requirement Analysis Dashboard</p>
         </div>
       </header>
 
@@ -90,7 +90,7 @@ function App() {
       </main>
 
       <footer className="app-footer">
-        <p>RAAG v2.0 - A polyglot microservices architecture demonstration</p>
+        <p>RAAG • Simple requirement analysis workspace</p>
       </footer>
     </div>
   );

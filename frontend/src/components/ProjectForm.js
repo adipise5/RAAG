@@ -111,22 +111,21 @@ function ProjectForm({ onSubmit }) {
 
   return (
     <div className="form-container">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', paddingBottom: '16px', borderBottom: '1px solid #e2e8f0' }}>
-        <h2 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 700, color: '#1e293b' }}>Create New Project</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', paddingBottom: '12px', borderBottom: '1px solid #d6dde6' }}>
+        <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700, color: '#1f2937' }}>Create New Project</h2>
         <button
           type="button"
           onClick={loadDemo}
           style={{
-            background: 'linear-gradient(135deg, #eef2ff, #e0e7ff)',
-            color: '#4f46e5',
-            border: '1px solid rgba(79,70,229,0.2)',
-            borderRadius: '8px',
-            padding: '8px 16px',
+            background: '#f3f4f6',
+            color: '#1f2937',
+            border: '1px solid #d1d5db',
+            borderRadius: '4px',
+            padding: '8px 12px',
             cursor: 'pointer',
             fontWeight: 600,
             fontSize: '0.82rem',
-            transition: 'all 0.2s ease',
-            letterSpacing: '0.2px'
+            transition: 'none'
           }}
         >
           Load Demo Project
@@ -134,12 +133,12 @@ function ProjectForm({ onSubmit }) {
       </div>
       {error && (
         <div style={{
-          color: '#dc2626',
+          color: '#b91c1c',
           marginBottom: '16px',
-          padding: '10px 14px',
-          background: '#fef2f2',
-          border: '1px solid rgba(220,38,38,0.15)',
-          borderRadius: '8px',
+          padding: '8px 12px',
+          background: '#f9fafb',
+          border: '1px solid #e5e7eb',
+          borderRadius: '4px',
           fontSize: '0.9rem',
           fontWeight: 500
         }}>
@@ -158,7 +157,7 @@ function ProjectForm({ onSubmit }) {
             placeholder="e.g., E-commerce Platform"
             required
           />
-          <small style={{ color: '#94a3b8', fontSize: '0.78rem' }}>{formData.name.length}/100</small>
+          <small style={{ color: '#6b7280', fontSize: '0.78rem' }}>{formData.name.length}/100</small>
         </div>
 
         <div className="form-group">
@@ -170,7 +169,7 @@ function ProjectForm({ onSubmit }) {
             placeholder="Describe your project in detail..."
             required
           />
-          <small style={{ color: '#94a3b8', fontSize: '0.78rem' }}>{formData.description.length}/2000</small>
+          <small style={{ color: '#6b7280', fontSize: '0.78rem' }}>{formData.description.length}/2000</small>
         </div>
 
         <div className="form-group">

@@ -4,6 +4,8 @@ A **polyglot microservices architecture** demonstrating modern software engineer
 
 ## 🏗️ Architecture Overview
 
+For updated DFD and RTM artifacts, see [`docs/dfd-rtm.md`](docs/dfd-rtm.md).
+
 **10 Microservices across 5 Programming Languages:**
 
 | Service | Language | Framework | Port | Purpose |
