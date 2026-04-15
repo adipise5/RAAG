@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
+import mermaid from 'mermaid';
 
 function Dashboard({ projectId, projectData, apiUrl }) {
   const [analysis, setAnalysis] = useState(null);
@@ -13,6 +14,9 @@ function Dashboard({ projectId, projectData, apiUrl }) {
   const [diagramType, setDiagramType] = useState('component');
   const [diagramLoading, setDiagramLoading] = useState(false);
   const [generatedSvg, setGeneratedSvg] = useState('');
+  const [dfdLevel0Svg, setDfdLevel0Svg] = useState('');
+  const [dfdLevel1Svg, setDfdLevel1Svg] = useState('');
+  const [dfdRenderError, setDfdRenderError] = useState('');
 
   const fetchAnalysisData = useCallback(async () => {
     try {
@@ -49,6 +53,61 @@ function Dashboard({ projectId, projectData, apiUrl }) {
   useEffect(() => {
     fetchAnalysisData();
   }, [fetchAnalysisData]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const renderDfdMermaid = async () => {
+      const level0Code = architecture?.dfd?.level_0?.mermaid;
+      const level1Code = architecture?.dfd?.level_1?.mermaid;
+
+      if (!level0Code && !level1Code) {
+        setDfdLevel0Svg('');
+        setDfdLevel1Svg('');
+        setDfdRenderError('');
+        return;
+      }
+
+      try {
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: 'loose',
+          theme: 'default'
+        });
+
+        let nextL0 = '';
+        let nextL1 = '';
+
+        if (level0Code) {
+          const { svg } = await mermaid.render(`dfd-l0-${Date.now()}`, level0Code);
+          nextL0 = svg;
+        }
+
+        if (level1Code) {
+          const { svg } = await mermaid.render(`dfd-l1-${Date.now()}`, level1Code);
+          nextL1 = svg;
+        }
+
+        if (!cancelled) {
+          setDfdLevel0Svg(nextL0);
+          setDfdLevel1Svg(nextL1);
+          setDfdRenderError('');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setDfdRenderError('Could not render Mermaid DFD.');
+          setDfdLevel0Svg('');
+          setDfdLevel1Svg('');
+        }
+      }
+    };
+
+    renderDfdMermaid();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [architecture?.dfd?.level_0?.mermaid, architecture?.dfd?.level_1?.mermaid]);
 
   const handleExportPDF = async () => {
     try {
@@ -526,21 +585,26 @@ function Dashboard({ projectId, projectData, apiUrl }) {
           {architecture.dfd && (
             <div style={{ marginTop: '24px' }}>
               <h3 style={{ marginBottom: '16px', fontSize: '1rem', fontWeight: 600, color: '#1e293b' }}>Data Flow Diagrams</h3>
-              {architecture.dfd.level_0?.svg && (
+              {dfdRenderError && (
+                <div style={{ marginBottom: '14px', padding: '10px 12px', borderRadius: '8px', background: '#fef2f2', border: '1px solid #fecaca', color: '#b91c1c', fontSize: '0.82rem' }}>
+                  {dfdRenderError}
+                </div>
+              )}
+              {(dfdLevel0Svg || architecture.dfd.level_0?.svg) && (
                 <div style={{ marginBottom: '24px' }}>
                   <h4 style={{ marginBottom: '10px', color: '#64748b', fontSize: '0.88rem', fontWeight: 600 }}>Level 0 — System Context</h4>
                   <div
                     style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '10px', padding: '16px', background: '#fff' }}
-                    dangerouslySetInnerHTML={{ __html: architecture.dfd.level_0.svg }}
+                    dangerouslySetInnerHTML={{ __html: dfdLevel0Svg || architecture.dfd.level_0?.svg }}
                   />
                 </div>
               )}
-              {architecture.dfd.level_1?.svg && (
+              {(dfdLevel1Svg || architecture.dfd.level_1?.svg) && (
                 <div>
                   <h4 style={{ marginBottom: '10px', color: '#64748b', fontSize: '0.88rem', fontWeight: 600 }}>Level 1 — Functional Decomposition</h4>
                   <div
                     style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '10px', padding: '16px', background: '#fff' }}
-                    dangerouslySetInnerHTML={{ __html: architecture.dfd.level_1.svg }}
+                    dangerouslySetInnerHTML={{ __html: dfdLevel1Svg || architecture.dfd.level_1?.svg }}
                   />
                 </div>
               )}

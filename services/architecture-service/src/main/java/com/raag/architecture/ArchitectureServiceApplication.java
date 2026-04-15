@@ -201,6 +201,7 @@ record RequirementGap(
 ) {}
 
 record DfdLevel(
+    @JsonProperty("mermaid") String mermaid,
         @JsonProperty("plantuml") String plantUml,
         String svg,
         List<String> nodes,
@@ -331,7 +332,8 @@ class ArchitectureService {
         response.setAdditionalDiagrams(additionalDiagrams);
 
         if (dfdBundle != null && dfdBundle.level1() != null) {
-            arch.setDiagram(dfdBundle.level1().plantUml());
+            String persistedDiagram = safe(dfdBundle.level1().mermaid(), dfdBundle.level1().plantUml());
+            arch.setDiagram(persistedDiagram);
             repository.save(arch);
         }
 
@@ -611,7 +613,7 @@ Return JSON array.
     ) {
         List<String> externalEntities = extractExternalEntities(description, requirements);
 
-        String level0Plant = generateDfdPlantUmlWithLlm(
+        String level0Mermaid = generateDfdMermaidWithLlm(
                 0,
                 projectName,
                 description,
@@ -620,8 +622,8 @@ Return JSON array.
                 externalEntities,
                 domain
         );
-        if (!isValidLevel0Dfd(level0Plant, externalEntities, projectName)) {
-            level0Plant = buildLevel0PlantUml(architectureStyle, externalEntities, projectName);
+        if (!isValidLevel0Mermaid(level0Mermaid, externalEntities, projectName)) {
+            level0Mermaid = buildLevel0MermaidFallback(externalEntities, projectName);
         }
 
         List<String> level0Nodes = new ArrayList<>(externalEntities);
@@ -642,13 +644,14 @@ Return JSON array.
         }
 
         DfdLevel level0 = new DfdLevel(
-                level0Plant,
-                renderSvg(level0Plant),
+        level0Mermaid,
+        null,
+        null,
                 level0Nodes,
                 level0Edges
         );
 
-        String level1Plant = generateDfdPlantUmlWithLlm(
+    String level1Mermaid = generateDfdMermaidWithLlm(
                 1,
                 projectName,
                 description,
@@ -657,8 +660,8 @@ Return JSON array.
                 externalEntities,
                 domain
         );
-        if (!isValidLevel1Dfd(level1Plant, externalEntities)) {
-            level1Plant = buildLevel1FallbackPlantUml(projectName, description, requirements, externalEntities, domain);
+    if (!isValidLevel1Mermaid(level1Mermaid, externalEntities)) {
+        level1Mermaid = buildLevel1MermaidFallback(projectName, description, requirements, externalEntities, domain);
         }
 
         List<String> derivedProcesses = deriveLevel1Processes(description, requirements, domain);
@@ -691,33 +694,34 @@ Return JSON array.
         }
 
         DfdLevel level1 = new DfdLevel(
-                level1Plant,
-                renderSvg(level1Plant),
-        level1Nodes,
+                level1Mermaid,
+                null,
+                null,
+                level1Nodes,
                 level1Edges
         );
 
         return new DfdBundle(level0, level1);
     }
 
-    private String generateDfdPlantUmlWithLlm(
+    private String generateDfdMermaidWithLlm(
             int level,
-        String projectName,
+            String projectName,
             String description,
             List<String> requirements,
             String architectureStyle,
-        List<String> externalEntities,
-        String domain
+            List<String> externalEntities,
+            String domain
     ) {
         String prompt = level == 0
-        ? buildDfdLevel0Prompt(projectName, description, requirements, architectureStyle, externalEntities, domain)
-        : buildDfdLevel1Prompt(projectName, description, requirements, architectureStyle, externalEntities, domain);
+                ? buildDfdLevel0Prompt(projectName, description, requirements, architectureStyle, externalEntities, domain)
+                : buildDfdLevel1Prompt(projectName, description, requirements, architectureStyle, externalEntities, domain);
 
         try {
             Map<String, Object> response = llmClient.callCustomPrompt(prompt);
-            String plant = extractPlantUmlFromResponse(response);
-            if (isValidPlantUml(plant)) {
-                return plant;
+            String mermaid = extractMermaidFromResponse(response);
+            if (isValidMermaid(mermaid)) {
+                return mermaid;
             }
         } catch (Exception ignored) {
             return null;
@@ -726,36 +730,30 @@ Return JSON array.
         return null;
     }
 
-    private boolean isValidLevel0Dfd(String plantUml, List<String> externalEntities, String projectName) {
-        if (!isValidPlantUml(plantUml)) {
+    private boolean isValidLevel0Mermaid(String mermaid, List<String> externalEntities, String projectName) {
+        if (!isValidMermaid(mermaid)) {
             return false;
         }
 
-        String lower = plantUml.toLowerCase(Locale.ROOT);
-        if (lower.contains("database ") || lower.contains("datastore") || lower.contains("storage ")) {
+        String lower = mermaid.toLowerCase(Locale.ROOT);
+        if (Pattern.compile("\\bD[1-9]\\d*\\b", Pattern.CASE_INSENSITIVE).matcher(mermaid).find()) {
             return false;
         }
-        if (Pattern.compile("\\bP[1-9]\\d*\\b", Pattern.CASE_INSENSITIVE).matcher(plantUml).find()) {
+        if (Pattern.compile("\\bP[1-9]\\d*\\b", Pattern.CASE_INSENSITIVE).matcher(mermaid).find()) {
+            return false;
+        }
+        if (!lower.contains("p0")) {
             return false;
         }
         String expectedProcessLabel = "P0: " + safe(projectName, "Project") + " System";
-        if (!plantUml.contains(expectedProcessLabel)) {
-            return false;
-        }
-
-        int processCount = 0;
-        Matcher processMatcher = Pattern.compile("(?i)(rectangle|process|component)\\s+\"[^\"]*" + Pattern.quote(expectedProcessLabel) + "[^\"]*\"").matcher(plantUml);
-        while (processMatcher.find()) {
-            processCount++;
-        }
-        if (processCount != 1) {
+        if (!mermaid.contains(expectedProcessLabel)) {
             return false;
         }
 
         for (String entity : externalEntities) {
-            String alias = alias(entity);
-            boolean hasInput = plantUml.contains(alias + " --> P0") || plantUml.contains(alias + "-> P0") || plantUml.contains(alias + "--> P0");
-            boolean hasOutput = plantUml.contains("P0 --> " + alias) || plantUml.contains("P0 -> " + alias) || plantUml.contains("P0 -->" + alias);
+            String nodeId = mermaidNodeId(entity);
+            boolean hasInput = Pattern.compile("(?i)" + Pattern.quote(nodeId) + "\\s*-+>\\s*P0").matcher(mermaid).find();
+            boolean hasOutput = Pattern.compile("(?i)P0\\s*-+>\\s*" + Pattern.quote(nodeId)).matcher(mermaid).find();
             if (!(hasInput && hasOutput)) {
                 return false;
             }
@@ -764,12 +762,12 @@ Return JSON array.
         return true;
     }
 
-    private boolean isValidLevel1Dfd(String plantUml, List<String> externalEntities) {
-        if (!isValidPlantUml(plantUml)) {
+    private boolean isValidLevel1Mermaid(String mermaid, List<String> externalEntities) {
+        if (!isValidMermaid(mermaid)) {
             return false;
         }
 
-        Matcher processMatcher = Pattern.compile("\\bP([1-9]\\d*)\\b").matcher(plantUml);
+        Matcher processMatcher = Pattern.compile("\\bP([1-9]\\d*)\\b").matcher(mermaid);
         Set<String> processes = new LinkedHashSet<>();
         while (processMatcher.find()) {
             processes.add("P" + processMatcher.group(1));
@@ -779,16 +777,17 @@ Return JSON array.
         }
 
         for (String entity : externalEntities) {
-            String entityAlias = alias(entity);
-            if (!plantUml.contains(entityAlias)) {
+            String entityNode = mermaidNodeId(entity);
+            if (!mermaid.contains(entityNode)) {
                 return false;
             }
         }
 
-        Matcher edgeMatcher = Pattern.compile("([A-Za-z0-9_]+)\\s*-+>\\s*([A-Za-z0-9_]+)").matcher(plantUml);
+        Matcher edgeMatcher = Pattern.compile("([A-Za-z0-9_]+)\\s*-+>\\s*([A-Za-z0-9_]+)").matcher(mermaid);
         Map<String, Integer> incoming = new HashMap<>();
         Map<String, Integer> outgoing = new HashMap<>();
         int processToProcessEdges = 0;
+        int processToStoreEdges = 0;
 
         while (edgeMatcher.find()) {
             String src = edgeMatcher.group(1);
@@ -802,9 +801,15 @@ Return JSON array.
             if (src.matches("P[1-9]\\d*") && dst.matches("P[1-9]\\d*")) {
                 processToProcessEdges++;
             }
+            if (src.matches("P[1-9]\\d*") && dst.matches("D[1-9]\\d*")) {
+                processToStoreEdges++;
+            }
         }
 
         if (processToProcessEdges == 0) {
+            return false;
+        }
+        if (!Pattern.compile("\\bD[1-9]\\d*\\b").matcher(mermaid).find() || processToStoreEdges == 0) {
             return false;
         }
 
@@ -828,7 +833,7 @@ Return JSON array.
     ) {
         return String.format("""
 You are a professional System Analyst.
-Generate Level 0 DFD in PlantUML based ONLY on the user's project idea.
+Generate a Level 0 Data Flow Diagram using Mermaid (flowchart syntax) and classical Yourdon/DeMarco DFD rules.
 
 Project Name:
 %s
@@ -849,20 +854,24 @@ External Entities (seed list, refine if needed):
 %s
 
 STRICT RULES (must follow exactly):
-1) Represent the whole system as ONE SINGLE process only.
-2) Show ONLY external entities and input/output data flows.
-3) Do NOT add internal subprocesses.
-4) Do NOT add data stores.
-5) Keep it high-level and abstract.
-6) Name the main process exactly: "P0: %s System".
-7) Do NOT include AI, RAAG internals, backend APIs, microservices, queues, or technical components.
-8) Use real domain entities from project description.
+1) Use ALL requirements and the full project description as source of truth.
+2) Identify ALL external entities mentioned or clearly implied by requirements.
+3) Represent the whole system as ONE process only named exactly: "P0: %s System".
+4) Level 0 MUST include only: external entities, process P0, and data flows.
+5) Level 0 MUST NOT include internal subprocesses or any data store.
+6) Every external entity must have at least one inbound and one outbound data flow with P0.
+7) Flows must be meaningful business data (not technical implementation terms).
+8) Do NOT include AI/RAAG internals, backend APIs, queues, microservices, or infrastructure details.
+
+MERMAID FORMAT RULES:
+- Start with: flowchart LR
+- External entities: Exx["E#: Name"]
+- Main process: P0(("P0: %s System"))
+- Use arrows with labels: Exx -->|data| P0 and P0 -->|data| Exx
 
 Return only JSON:
-{"plantuml_code":"@startuml ... @enduml"}
-
-PlantUML must start with @startuml and end with @enduml.
-""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"));
+{"mermaid_code":"flowchart LR\\n..."}
+""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"), safe(projectName, "Project"));
     }
 
     private String buildDfdLevel1Prompt(
@@ -875,7 +884,7 @@ PlantUML must start with @startuml and end with @enduml.
     ) {
         return String.format("""
 You are a professional System Analyst.
-Generate Level 1 DFD in PlantUML by decomposing P0 for the same user project.
+Generate a Level 1 Data Flow Diagram using Mermaid (flowchart syntax) and classical Yourdon/DeMarco DFD rules.
 
 Project Name:
 %s
@@ -896,20 +905,92 @@ External Entities to stay consistent with Level 0:
 %s
 
 STRICT RULES (must follow exactly):
-1) Decompose P0: %s System into 4-6 meaningful domain-specific subprocesses (P1, P2, ...).
-2) Each subprocess must show inputs and outputs.
-3) Include data stores (D1, D2...) only when applicable.
-4) Show proper data flow between subprocesses, external entities, and data stores.
-5) Maintain consistency with Level 0 external entities.
-6) Keep names practical and derived from user project context.
-7) Do NOT include AI, RAAG internals, backend APIs, microservices, queues, or technical components.
-8) Avoid duplicate flows and keep the diagram readable.
+1) Use ALL functional requirements; do not omit any requirement intent.
+2) Decompose "P0: %s System" into domain-specific processes P1..Pn.
+3) Ensure each process has meaningful inputs and outputs.
+4) Include ALL explicit or implied data stores as D1..Dn.
+5) Show proper data flows among external entities, processes, and data stores.
+6) Maintain consistency with Level 0 entities.
+7) Avoid technical architecture terms (APIs, microservices, queues, framework internals).
+8) Use clear business names and preserve complete requirement coverage.
+
+MERMAID FORMAT RULES:
+- Start with: flowchart LR
+- Entities: Exx["E#: Name"]
+- Processes: Pn(("Pn: Process Name"))
+- Data stores: Dn[("Dn: Data Store Name")]
+- Use labeled arrows for all flows.
 
 Return only JSON:
-{"plantuml_code":"@startuml ... @enduml"}
-
-PlantUML must start with @startuml and end with @enduml.
+{"mermaid_code":"flowchart LR\\n..."}
 """, safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"));
+    }
+
+    private String buildLevel0MermaidFallback(List<String> externalEntities, String projectName) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("flowchart LR\n");
+        sb.append("  P0((\"P0: ").append(escapeMermaid(projectName)).append(" System\"))\n");
+
+        for (int i = 0; i < externalEntities.size(); i++) {
+            String entity = externalEntities.get(i);
+            String id = mermaidNodeId(entity);
+            sb.append("  ").append(id).append("[\"E").append(i + 1).append(": ").append(escapeMermaid(entity)).append("\"]\n");
+            sb.append("  ").append(id).append(" -->|request data| P0\n");
+            sb.append("  P0 -->|response data| ").append(id).append("\n");
+        }
+        return sb.toString();
+    }
+
+    private String buildLevel1MermaidFallback(
+            String projectName,
+            String description,
+            List<String> requirements,
+            List<String> externalEntities,
+            String domain
+    ) {
+        List<String> processes = deriveLevel1Processes(description, requirements, domain);
+        List<String> stores = deriveDataStores(description, requirements, domain);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("flowchart LR\n");
+
+        for (int i = 0; i < externalEntities.size(); i++) {
+            String entity = externalEntities.get(i);
+            String id = mermaidNodeId(entity);
+            sb.append("  ").append(id).append("[\"E").append(i + 1).append(": ").append(escapeMermaid(entity)).append("\"]\n");
+        }
+
+        for (int i = 0; i < processes.size(); i++) {
+            sb.append("  P").append(i + 1).append("((\"P").append(i + 1).append(": ").append(escapeMermaid(processes.get(i))).append("\"))\n");
+        }
+
+        for (int i = 0; i < stores.size(); i++) {
+            sb.append("  D").append(i + 1).append("[(\"D").append(i + 1).append(": ").append(escapeMermaid(stores.get(i))).append("\")]\n");
+        }
+
+        if (!processes.isEmpty()) {
+            String first = "P1";
+            String last = "P" + processes.size();
+
+            for (String entity : externalEntities) {
+                String id = mermaidNodeId(entity);
+                sb.append("  ").append(id).append(" -->|business request| ").append(first).append("\n");
+                sb.append("  ").append(last).append(" -->|business response| ").append(id).append("\n");
+            }
+
+            for (int i = 1; i < processes.size(); i++) {
+                sb.append("  P").append(i).append(" -->|processed data| P").append(i + 1).append("\n");
+            }
+
+            for (int i = 1; i <= stores.size(); i++) {
+                int p = Math.min(i, processes.size());
+                sb.append("  P").append(p).append(" -->|write/read| D").append(i).append("\n");
+                sb.append("  D").append(i).append(" -->|stored data| P").append(p).append("\n");
+            }
+        }
+
+        sb.append("  %% P0 context: ").append(escapeMermaid(projectName)).append(" System\n");
+        return sb.toString();
     }
 
     private List<String> extractExternalEntities(String description, List<String> requirements) {
@@ -1993,6 +2074,85 @@ PlantUML must start with @startuml and end with @enduml.
         return lower.contains("@startuml") && lower.contains("@enduml");
     }
 
+    private String extractMermaidFromResponse(Map<String, Object> response) {
+        if (response == null || response.isEmpty()) {
+            return null;
+        }
+
+        Object direct = response.get("mermaid_code");
+        if (direct instanceof String s && isValidMermaid(s)) {
+            return s.trim();
+        }
+
+        Object result = response.get("result");
+        if (result instanceof Map<?, ?> map) {
+            Object code = map.get("mermaid_code");
+            if (code instanceof String s && isValidMermaid(s)) {
+                return s.trim();
+            }
+            Object nestedResult = map.get("result");
+            if (nestedResult instanceof String s) {
+                String extracted = extractMermaidFromText(s);
+                if (isValidMermaid(extracted)) {
+                    return extracted;
+                }
+            }
+        }
+
+        if (result instanceof String textResult) {
+            String extracted = extractMermaidFromText(textResult);
+            if (isValidMermaid(extracted)) {
+                return extracted;
+            }
+        }
+
+        String fallbackText = extractResultString(response);
+        return extractMermaidFromText(fallbackText);
+    }
+
+    private String extractMermaidFromText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+
+        String trimmed = raw.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> parsed = objectMapper.readValue(trimmed, Map.class);
+                String code = safe(parsed.get("mermaid_code"), "");
+                if (isValidMermaid(code)) {
+                    return code;
+                }
+            } catch (Exception ignored) {
+                // continue with generic extraction
+            }
+        }
+
+        Matcher fenced = Pattern.compile("```(?:mermaid)?\\s*([\\s\\S]*?)```", Pattern.CASE_INSENSITIVE).matcher(trimmed);
+        if (fenced.find()) {
+            String candidate = fenced.group(1).trim();
+            if (isValidMermaid(candidate)) {
+                return candidate;
+            }
+        }
+
+        Matcher flowchart = Pattern.compile("((?:flowchart|graph)\\s+[A-Za-z]{2}[\\s\\S]*)", Pattern.CASE_INSENSITIVE).matcher(trimmed);
+        if (flowchart.find()) {
+            return flowchart.group(1).trim();
+        }
+
+        return null;
+    }
+
+    private boolean isValidMermaid(String mermaid) {
+        if (mermaid == null || mermaid.isBlank()) {
+            return false;
+        }
+        String lower = mermaid.toLowerCase(Locale.ROOT).trim();
+        return lower.startsWith("flowchart") || lower.startsWith("graph");
+    }
+
     private List<String> extractResultList(Map<String, Object> response, List<String> fallback) {
         try {
             Object result = response.get("result");
@@ -2077,6 +2237,22 @@ PlantUML must start with @startuml and end with @enduml.
             return "N_" + cleaned;
         }
         return cleaned;
+    }
+
+    private String mermaidNodeId(String name) {
+        String base = safe(name, "Entity").replaceAll("[^A-Za-z0-9]", "_");
+        if (base.isBlank()) {
+            base = "Entity_" + Math.abs(name.hashCode());
+        }
+        if (Character.isDigit(base.charAt(0))) {
+            base = "E_" + base;
+        }
+        return base;
+    }
+
+    private String escapeMermaid(String input) {
+        if (input == null) return "";
+        return input.replace("\"", "'");
     }
 
     private String escapePlant(String input) {
