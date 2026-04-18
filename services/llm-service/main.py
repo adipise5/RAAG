@@ -19,8 +19,8 @@ app = FastAPI()
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 MAX_LLM_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
 
 mongo_client = MongoClient(MONGO_URL)
 db = mongo_client["raag_projects"]
@@ -917,42 +917,21 @@ def build_combined_analysis_prompt(text: str) -> str:
     """
     Single-shot prompt that returns BOTH classification AND quality analysis for
     one requirement.  Cuts LLM calls per requirement from 2 → 1.
-    Kept deliberately concise to reduce Ollama prefill latency.
+    Optimized for fast Ollama inference with q5_0 quantization.
     """
-    schema = {
-        "classification": "FR|NFR|MIXED",
-        "confidence": 0.95,
-        "subcategory": ["Security"],
-        "justification": "one sentence",
-        "quality_issues": ["string"],
-        "score": 85,
-        "vagueness": False,
-        "missing_elements": [],
-        "rewritten_requirement": "The system shall ... within <metric>.",
-        "priority": "High|Medium|Low",
-        "entities": ["string"],
-        "processes": ["string"],
-        "data_stores": ["string"]
-    }
     return (
-        "You are a requirements engineering expert. Analyze this software requirement in one pass "
-        "and return ONLY valid JSON — no markdown, no prose.\n\n"
+        "Analyze this requirement in one pass. Return ONLY JSON (no markdown or prose).\n\n"
         f"Requirement: {json.dumps(text)}\n\n"
-        f"Return JSON matching exactly: {json.dumps(schema, ensure_ascii=False)}\n\n"
-        "Rules:\n"
-        "- classification: FR (functional — user actions, data processing, business logic), "
-        "NFR (non-functional — performance, security, usability, reliability), or MIXED.\n"
-        "- subcategory: pick from [Security, Performance, Reliability, Usability, Compliance, "
-        "Data Management, Authentication, Integration, UI/UX, Business Logic, Reporting].\n"
-        "- score: 0-100 using IEEE 830 criteria (unambiguous, testable, complete, consistent, traceable). "
-        "Deduct for vague terms (fast, easy, etc), missing actor/action/condition, no measurable metric.\n"
-        "- vagueness: true if requirement uses vague terms like fast, easy, simple, robust, seamless, efficient.\n"
-        "- missing_elements: list from [Actor, Action, Condition, Metric] that are absent.\n"
-        "- rewritten_requirement: SMART rewrite — specific actor, measurable criteria, testable condition.\n"
-        "- priority: High (security, core business, data integrity), Medium (usability, reporting), Low (nice-to-have).\n"
-        "- entities: external actors or systems mentioned (e.g., User, Admin, Payment Gateway).\n"
-        "- processes: verbs/actions described (e.g., authenticate, generate report, encrypt data).\n"
-        "- data_stores: data repositories implied (e.g., User Database, Audit Log, Session Store)."
+        "Return JSON:\n"
+        '{"classification":"FR/NFR/MIXED","confidence":0.95,"subcategory":["Security"],'
+        '"justification":"1-2 sentences","score":85,"vagueness":false,'
+        '"missing_elements":[],"rewritten_requirement":"SMART version",'
+        '"priority":"High/Medium/Low","entities":["Actor"],'
+        '"processes":["verb"],"data_stores":["Storage"]}\n\n'
+        "Scoring: 0-100 via IEEE 830 (clear? testable? complete? consistent? traceable?). "
+        "Deduct 20pts for vague terms (fast, easy, simple, robust, seamless), 15pts per missing element (Actor/Action/Condition/Metric). "
+        "Classification: FR = user action/business logic, NFR = performance/security/usability/reliability, MIXED = both. "
+        "Priority: High = security/core/data-integrity, Medium = usability/reporting, Low = nice-to-have."
     )
 
 
@@ -1039,8 +1018,8 @@ async def _pull_ollama_model_bg():
 @app.on_event("startup")
 async def startup_event():
     global _ollama_semaphore
-    # Allow at most 4 concurrent Ollama calls — prevents memory thrashing on 8 GB GPU
-    _ollama_semaphore = asyncio.Semaphore(4)
+    # Allow at most 8 concurrent Ollama calls — q5_0 quantization fits comfortably on RTX 4060 8GB
+    _ollama_semaphore = asyncio.Semaphore(8)
     asyncio.create_task(_pull_ollama_model_bg())
 
 
@@ -1058,9 +1037,10 @@ async def call_ollama(prompt: str) -> str:
             "model": OLLAMA_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "keep_alive": -1,     # pin model in VRAM indefinitely — eliminates cold-start reload between requests
             "options": {
                 "temperature": 0.0,   # fully deterministic — faster + more consistent JSON
-                "num_ctx": 2048,      # our prompts fit in ~400 tokens; 2048 is generous
+                "num_ctx": 1024,      # prompts fit in ~400 tokens; 1024 cuts prefill vs 2048
                 "num_predict": 512,   # all JSON responses fit in 512 tokens; prevents runaway
             },
         }

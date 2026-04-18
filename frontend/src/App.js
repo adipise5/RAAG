@@ -90,7 +90,7 @@ function App() {
       </main>
 
       <footer className="app-footer">
-        <p>RAAG • Simple requirement analysis workspace</p>
+        <p>RAAG</p>
       </footer>
     </div>
   );

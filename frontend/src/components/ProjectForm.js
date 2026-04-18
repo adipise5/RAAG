@@ -24,6 +24,27 @@ const DEMO_PROJECT = {
   ]
 };
 
+const DEMO_PROJECT_B = {
+  name: "EduFlow Corporate LMS",
+  description: "A web-based Learning Management System for mid-to-large enterprises to manage internal employee training programs. HR managers can build a course catalog, assign courses to teams, and track completion. Employees access video lessons, take quizzes, and earn verifiable certificates. The platform must integrate with the company's existing identity provider via SAML 2.0 SSO, support SCORM-packaged third-party content, and scale to handle thousands of simultaneous learners during company-wide training rollouts.",
+  proposed_architecture: "Layered (N-Tier)",
+  domain: "Education",
+  requirements: [
+    { text: "The system shall authenticate employees using SAML 2.0 SSO integration with the company's identity provider (e.g., Okta, Azure AD), provisioning accounts automatically on first login without requiring manual HR setup." },
+    { text: "HR managers shall be able to create courses composed of ordered modules (video, document, or quiz), set a mandatory completion deadline per assignment, and bulk-assign courses to one or more teams or departments." },
+    { text: "The system shall stream video lessons using adaptive bitrate (ABR) delivery, automatically adjusting quality based on the learner's available bandwidth, and persist the playback position so learners can resume where they left off." },
+    { text: "The system shall deliver auto-graded quizzes with a configurable pass-mark threshold (0–100%) per quiz, allow up to 3 retake attempts by default, and immediately display the learner's score and correct answers upon submission." },
+    { text: "Upon successful course completion, the system shall automatically generate a tamper-evident PDF certificate containing the learner's name, course title, completion date, and a unique QR code that resolves to a publicly accessible verification URL." },
+    { text: "The system shall support upload and playback of SCORM 1.2 and xAPI (Tin Can) content packages, tracking completion status and score data back into the learner's progress record." },
+    { text: "The system should be intuitive and visually clean so that employees with no technical background can navigate and complete their assigned courses without needing any training." },
+    { text: "The system shall provide managers with a real-time team progress dashboard showing per-employee completion status, time spent, quiz scores, and overdue assignments, with the ability to export reports as XLSX or PDF." },
+    { text: "The system shall send automated email reminders to learners 7 days and 3 days before a course deadline, and notify their direct manager if the course remains incomplete 1 day after the deadline." },
+    { text: "The system shall support a minimum of 2,000 concurrent video streaming sessions without buffering or degraded quiz functionality, validated under load testing conditions." },
+    { text: "Admin users shall be able to manage the course catalog including creating categories, archiving outdated courses, setting global enrollment rules, and viewing platform-wide analytics." },
+    { text: "The application should be fast and responsive on both desktop and mobile browsers." },
+  ]
+};
+
 function ProjectForm({ onSubmit }) {
   const [formData, setFormData] = useState({
     name: '',
@@ -74,6 +95,11 @@ function ProjectForm({ onSubmit }) {
     setError('');
   };
 
+  const loadDemoB = () => {
+    setFormData(DEMO_PROJECT_B);
+    setError('');
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -113,23 +139,44 @@ function ProjectForm({ onSubmit }) {
     <div className="form-container">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', paddingBottom: '12px', borderBottom: '1px solid #d6dde6' }}>
         <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700, color: '#1f2937' }}>Create New Project</h2>
-        <button
-          type="button"
-          onClick={loadDemo}
-          style={{
-            background: '#f3f4f6',
-            color: '#1f2937',
-            border: '1px solid #d1d5db',
-            borderRadius: '4px',
-            padding: '8px 12px',
-            cursor: 'pointer',
-            fontWeight: 600,
-            fontSize: '0.82rem',
-            transition: 'none'
-          }}
-        >
-          Load Demo Project
-        </button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            type="button"
+            onClick={loadDemo}
+            title="Healthcare Patient Portal — Microservices"
+            style={{
+              background: '#f3f4f6',
+              color: '#1f2937',
+              border: '1px solid #d1d5db',
+              borderRadius: '4px',
+              padding: '8px 12px',
+              cursor: 'pointer',
+              fontWeight: 600,
+              fontSize: '0.82rem',
+              transition: 'none'
+            }}
+          >
+            Demo A
+          </button>
+          <button
+            type="button"
+            onClick={loadDemoB}
+            title="Corporate LMS — Layered N-Tier"
+            style={{
+              background: '#f3f4f6',
+              color: '#1f2937',
+              border: '1px solid #d1d5db',
+              borderRadius: '4px',
+              padding: '8px 12px',
+              cursor: 'pointer',
+              fontWeight: 600,
+              fontSize: '0.82rem',
+              transition: 'none'
+            }}
+          >
+            Demo B
+          </button>
+        </div>
       </div>
       {error && (
         <div style={{

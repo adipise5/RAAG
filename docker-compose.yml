@@ -150,8 +150,8 @@ services:
       MONGO_URL: mongodb://admin:password@mongodb:27017
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       OLLAMA_URL: http://ollama:11434
-      OLLAMA_MODEL: llama3.1:8b
-      OLLAMA_TIMEOUT_SECONDS: 120
+      OLLAMA_MODEL: qwen2.5:7b
+      OLLAMA_TIMEOUT_SECONDS: 60
     networks:
       - raag-network
 
@@ -258,7 +258,7 @@ services:
   # Supports GPU acceleration on NVIDIA (requires NVIDIA Container Toolkit):
   #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
   # On Mac (M1/M2/M3/M4) or CPU-only systems, runs efficiently with CPU
-  # The model is pulled automatically on first start (background, ~4.7 GB download).
+  # The model is pulled automatically on first start (background).
   ollama:
     image: ollama/ollama:latest
     ports:
@@ -266,13 +266,13 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     # GPU acceleration is optional - uncomment the deploy section below to enable NVIDIA GPU
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     networks:
       - raag-network
 
