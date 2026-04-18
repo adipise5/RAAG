@@ -32,6 +32,7 @@ function Dashboard({ projectId, projectData, apiUrl }) {
           projectId,
           projectName: projectData?.name || '',
           proposedStyle: projectData?.proposed_architecture || 'Microservices',
+          useSelectedArchitectureForReport: projectData?.use_selected_architecture_for_report !== false,
           requirements: projectData?.requirements?.map(r => r.text) || [],
           projectDescription: projectData?.description || '',
           domain: projectData?.domain || 'General'
@@ -347,7 +348,11 @@ function Dashboard({ projectId, projectData, apiUrl }) {
           <h2>Architecture Recommendation</h2>
           <div className="metric-grid">
             <div className="metric-card">
-              <h3>Recommended Style</h3>
+              <h3>Report Architecture</h3>
+              <div className="value" style={{ fontSize: '1rem' }}>{architecture.reportStyle || architecture.recommendedStyle}</div>
+            </div>
+            <div className="metric-card">
+              <h3>LLM Recommended</h3>
               <div className="value" style={{ fontSize: '1rem' }}>{architecture.recommendedStyle}</div>
             </div>
             <div className="metric-card">

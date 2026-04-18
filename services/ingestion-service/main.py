@@ -28,6 +28,7 @@ class Project(BaseModel):
     description: str
     requirements: List[Requirement]
     proposed_architecture: str
+    use_selected_architecture_for_report: Optional[bool] = True
     domain: Optional[str] = None
 
 async def emit_to_rabbitmq(message: dict):
@@ -49,6 +50,7 @@ async def create_project(project: Project):
             "name": project.name,
             "description": project.description,
             "proposed_architecture": project.proposed_architecture,
+            "use_selected_architecture_for_report": project.use_selected_architecture_for_report,
             "domain": project.domain,
             "created_at": datetime.utcnow(),
             "status": "ingested"

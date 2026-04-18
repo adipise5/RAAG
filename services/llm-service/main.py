@@ -638,7 +638,7 @@ def fallback_custom_generate(prompt: str) -> Dict[str, Any]:
             ]
         }
 
-    if "explain why" in lower_prompt and ("best for this project" in lower_prompt or "specific reasons" in lower_prompt):
+    if "explain why" in lower_prompt or ("best for this project" in lower_prompt or "specific reasons" in lower_prompt):
         return {
             "result": [
                 "The architecture aligns with the project's core functional and quality requirements",
@@ -647,7 +647,7 @@ def fallback_custom_generate(prompt: str) -> Dict[str, Any]:
             ]
         }
 
-    if "choose best architecture" in lower_prompt or "return only one architecture name" in lower_prompt:
+    if "choose best architecture" in lower_prompt or "return only one architecture name" in lower_prompt or "single best architecture" in lower_prompt:
         if any(k in lower_prompt for k in ["real-time", "event", "stream"]):
             return {"result": "Event-Driven"}
         if any(k in lower_prompt for k in ["scale", "scalability", "millions", "distributed"]):
@@ -672,16 +672,14 @@ def build_json_prompt(
     """
     Compact prompt template.  Keeps <INPUT_JSON> tags so fallback_from_prompt
     can still extract the inputs if both LLMs fail.
-    Schema and example are inlined (no indentation) to minimise token count.
+    Example alone implies the schema — no need to duplicate it.
     """
     return (
-        f"You are an expert requirements engineering and software architecture assistant.\n"
         f"TASK: {task}\n"
         f"Objective: {objective}\n"
-        f"Return ONLY valid JSON. No markdown. No prose.\n\n"
+        f"Return ONLY valid JSON matching the example structure. No markdown. No prose.\n\n"
         f"<INPUT_JSON>{json.dumps(input_payload, ensure_ascii=False)}</INPUT_JSON>\n\n"
-        f"Schema: {json.dumps(output_schema, ensure_ascii=False)}\n"
-        f"Example: {json.dumps(example_output, ensure_ascii=False)}"
+        f"Example output: {json.dumps(example_output, ensure_ascii=False)}"
     )
 
 
@@ -764,7 +762,7 @@ def build_rewrite_prompt(text: str) -> str:
 def build_gap_prompt(requirements: List[str]) -> str:
     return build_json_prompt(
         task="GAP_ANALYSIS",
-        objective="Detect missing requirement categories: Security, Performance, Reliability, Usability, Compliance.",
+        objective="Identify missing requirement categories. A gap exists when NONE of the requirements address a category. Check: Security (auth, encryption, access control), Performance (latency, throughput, scalability), Reliability (uptime, failover, backup), Usability (accessibility, onboarding, UX), Compliance (GDPR, HIPAA, audit trails). Only report genuinely missing categories.",
         input_payload={"requirements": requirements},
         output_schema={
             "gaps": [
@@ -780,7 +778,7 @@ def build_gap_prompt(requirements: List[str]) -> str:
                 {
                     "gap": "No security requirements found",
                     "severity": "Critical",
-                    "suggestion": "System shall enforce JWT-based authentication and encrypt sensitive data in transit and at rest."
+                    "suggestion": "Add requirements for authentication, authorization, and data encryption."
                 }
             ]
         }
@@ -790,25 +788,15 @@ def build_gap_prompt(requirements: List[str]) -> str:
 def build_traceability_prompt(requirements: List[str], architecture_components: List[str]) -> str:
     return build_json_prompt(
         task="TRACEABILITY_MATRIX",
-        objective="Map each requirement to one or more architecture components and identify traceability risks.",
+        objective="Map each requirement to the architecture components that implement it. A requirement is 'untraced' if no component handles it. A component is 'high density' if it handles 3+ requirements. Use the actual requirement text and component names provided.",
         input_payload={
             "requirements": requirements,
             "architecture_components": architecture_components
         },
         output_schema={
-            "matrix": [
-                {
-                    "requirement": "string",
-                    "components": ["string"]
-                }
-            ],
+            "matrix": [{"requirement": "string", "components": ["string"]}],
             "untraced_requirements": ["string"],
-            "high_density_components": [
-                {
-                    "component": "string",
-                    "requirement_count": 0
-                }
-            ]
+            "high_density_components": [{"component": "string", "requirement_count": 0}]
         },
         example_output={
             "matrix": [
@@ -831,7 +819,7 @@ def build_traceability_prompt(requirements: List[str], architecture_components: 
 def build_risk_prompt(project_description: str, requirements: List[str]) -> str:
     return build_json_prompt(
         task="RISK_ASSUMPTION",
-        objective="Extract implicit assumptions and delivery risks with severity and mitigation.",
+        objective="Identify 3-8 delivery risks and implicit assumptions. Risk=something that could go wrong (external dependency failure, performance bottleneck, scope creep). Assumption=unstated belief the requirements depend on (e.g. users have internet, third-party API available). Rate severity by business impact.",
         input_payload={
             "project_description": project_description,
             "requirements": requirements
@@ -862,7 +850,7 @@ def build_risk_prompt(project_description: str, requirements: List[str]) -> str:
 def build_complexity_prompt(requirements: List[str]) -> str:
     return build_json_prompt(
         task="COMPLEXITY_ESTIMATION",
-        objective="Estimate function points, story points, effort weeks, and top 5 complex requirements.",
+        objective="Estimate project size. function_points: IFPUG count (inputs+outputs+inquiries+files+interfaces). story_points: total across all requirements using Fibonacci scale. effort_estimate_weeks: for a team of 3-5 developers. top_complex_requirements: pick the 5 hardest to implement.",
         input_payload={"requirements": requirements},
         output_schema={
             "function_points": 0,
@@ -884,7 +872,7 @@ def build_complexity_prompt(requirements: List[str]) -> str:
 def build_novelty_prompt(project_description: str, requirements: List[str], domain: str) -> str:
     return build_json_prompt(
         task="NOVELTY_ASSESSMENT",
-        objective="Assess novelty from technical, domain, and approach dimensions with a single score.",
+        objective="Rate project novelty 0-100. technical: how unusual is the tech stack/integration complexity. domain: how niche or specialized is the business domain. approach: how unconventional is the solution design. score: weighted average. Conventional=0-25, Incremental=26-50, Moderately Novel=51-75, Novel=76-100.",
         input_payload={
             "project_description": project_description,
             "domain": domain,
@@ -917,21 +905,29 @@ def build_combined_analysis_prompt(text: str) -> str:
     """
     Single-shot prompt that returns BOTH classification AND quality analysis for
     one requirement.  Cuts LLM calls per requirement from 2 → 1.
-    Optimized for fast Ollama inference with q5_0 quantization.
+    Structured with explicit rules for reliable 7B-model output.
     """
     return (
-        "Analyze this requirement in one pass. Return ONLY JSON (no markdown or prose).\n\n"
+        "Classify and score this software requirement. Return ONLY valid JSON.\n\n"
         f"Requirement: {json.dumps(text)}\n\n"
-        "Return JSON:\n"
-        '{"classification":"FR/NFR/MIXED","confidence":0.95,"subcategory":["Security"],'
-        '"justification":"1-2 sentences","score":85,"vagueness":false,'
-        '"missing_elements":[],"rewritten_requirement":"SMART version",'
-        '"priority":"High/Medium/Low","entities":["Actor"],'
-        '"processes":["verb"],"data_stores":["Storage"]}\n\n'
-        "Scoring: 0-100 via IEEE 830 (clear? testable? complete? consistent? traceable?). "
-        "Deduct 20pts for vague terms (fast, easy, simple, robust, seamless), 15pts per missing element (Actor/Action/Condition/Metric). "
-        "Classification: FR = user action/business logic, NFR = performance/security/usability/reliability, MIXED = both. "
-        "Priority: High = security/core/data-integrity, Medium = usability/reporting, Low = nice-to-have."
+        "Rules:\n"
+        "- classification: FR=user action/business logic, NFR=quality attribute (performance/security/usability/reliability), MIXED=both\n"
+        "- confidence: 0.0-1.0 how certain the classification is\n"
+        "- subcategory: specific category like Security, Performance, Usability, Data, Authentication, Reporting\n"
+        "- score: 0-100 per IEEE 830 (clear, testable, complete, consistent, traceable). Deduct 20 for vague terms (fast/easy/simple/robust/seamless), 15 per missing element (Actor/Action/Condition/Metric)\n"
+        "- vagueness: true if vague terms present\n"
+        "- missing_elements: from [Actor, Action, Condition, Metric] — only list what is missing\n"
+        "- rewritten_requirement: Specific, Measurable, Achievable, Relevant, Time-bound rewrite\n"
+        "- priority: High=security/core/data-integrity, Medium=usability/reporting, Low=nice-to-have\n"
+        "- entities: actors or systems mentioned\n"
+        "- processes: action verbs\n"
+        "- data_stores: databases or storage implied\n\n"
+        "Example output:\n"
+        '{"classification":"NFR","confidence":0.92,"subcategory":["Performance"],'
+        '"justification":"Constrains response latency under load.","score":74,"vagueness":true,'
+        '"missing_elements":["Condition"],"rewritten_requirement":"The system shall respond to API requests within 200ms for 95% of requests under 500 concurrent users.",'
+        '"priority":"High","entities":["System"],'
+        '"processes":["respond"],"data_stores":[]}'
     )
 
 
@@ -1027,11 +1023,15 @@ async def call_ollama(prompt: str) -> str:
     """
     Send a plain prompt to the local Ollama model and return the text response.
     Uses the OpenAI-compatible /v1/chat/completions endpoint.
-    Concurrency is limited by _ollama_semaphore (≤4 simultaneous calls).
-    num_ctx=2048 and num_predict=512 cap memory use and prevent runaway generation.
+    Concurrency is limited by _ollama_semaphore (≤8 simultaneous calls).
+    num_ctx auto-scales: short prompts (per-requirement) use 1024,
+    longer prompts (DFD/traceability/gap) use 2048 for full context.
     """
     import httpx
     sem = _ollama_semaphore or asyncio.Semaphore(4)
+    # Auto-scale context window: short prompts fit 1024, long ones need 2048
+    estimated_tokens = len(prompt) // 3  # rough char-to-token ratio
+    num_ctx = 2048 if estimated_tokens > 600 else 1024
     async with sem:
         payload = {
             "model": OLLAMA_MODEL,
@@ -1040,7 +1040,7 @@ async def call_ollama(prompt: str) -> str:
             "keep_alive": -1,     # pin model in VRAM indefinitely — eliminates cold-start reload between requests
             "options": {
                 "temperature": 0.0,   # fully deterministic — faster + more consistent JSON
-                "num_ctx": 1024,      # prompts fit in ~400 tokens; 1024 cuts prefill vs 2048
+                "num_ctx": num_ctx,
                 "num_predict": 512,   # all JSON responses fit in 512 tokens; prevents runaway
             },
         }
@@ -1851,20 +1851,14 @@ def fallback_diagram_code(prompt: str, diagram_type: str) -> str:
 
 
 def build_diagram_prompt(prompt: str, diagram_type: str) -> str:
-    example = DIAGRAM_TYPE_EXAMPLES.get(diagram_type, DIAGRAM_TYPE_EXAMPLES["component"])
     return (
-        f"Generate PlantUML diagram code for the following request.\n"
-        f"Diagram type: {diagram_type}\n"
-        f"Request: {prompt}\n\n"
-        f"Return ONLY valid JSON in this exact format:\n"
-        f'{{\"plantuml_code\": \"<full PlantUML code starting @startuml and ending @enduml>\"}}\n\n'
-        f"Example of a {diagram_type} diagram (use as style guide only, not as the answer):\n"
-        f"{example}\n\n"
+        f"Generate a {diagram_type} diagram in PlantUML for this request:\n"
+        f"{prompt}\n\n"
+        f"Return ONLY JSON: {{\"plantuml_code\": \"@startuml ...your code... @enduml\"}}\n\n"
         f"Rules:\n"
-        f"1. Code must start with @startuml and end with @enduml.\n"
-        f"2. Tailor node names and relationships to the user's request.\n"
-        f"3. Use readable labels.\n"
-        f"4. Return only JSON, no prose.\n"
+        f"1. Must start with @startuml and end with @enduml.\n"
+        f"2. Use descriptive node names and relationship labels specific to the request.\n"
+        f"3. No prose, no markdown — only the JSON object."
     )
 
 
@@ -1926,17 +1920,10 @@ async def generate_diagram(request: DiagramRequest):
 # API: CHAT
 # ==============================
 def build_chat_prompt(question: str, context: Optional[str]) -> str:
-    base = (
-        "You are an AI assistant for RAAG (Requirement Analysis & Architecture Generator). "
-        "Your role is to help software engineers understand their project requirements, "
-        "architecture decisions, and quality analysis results.\n\n"
-    )
+    base = "You are a software engineering assistant. Answer concisely about requirements, architecture, and quality analysis.\n\n"
     if context:
-        base += f"Project context:\n{context}\n\n"
-    base += (
-        f"User question: {question}\n\n"
-        "Respond helpfully and concisely. Focus on the project requirements and architecture when relevant."
-    )
+        base += f"Context:\n{context}\n\n"
+    base += f"Question: {question}"
     return base
 
 

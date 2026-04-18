@@ -98,6 +98,7 @@ class ArchitectureRequest {
     private String projectId;
     private String projectName;
     private String proposedStyle;
+    private Boolean useSelectedArchitectureForReport;
     private List<String> requirements;
     private String projectDescription;
     private String domain;
@@ -110,6 +111,9 @@ class ArchitectureRequest {
 
     public String getProposedStyle() { return proposedStyle; }
     public void setProposedStyle(String proposedStyle) { this.proposedStyle = proposedStyle; }
+
+    public Boolean getUseSelectedArchitectureForReport() { return useSelectedArchitectureForReport; }
+    public void setUseSelectedArchitectureForReport(Boolean useSelectedArchitectureForReport) { this.useSelectedArchitectureForReport = useSelectedArchitectureForReport; }
 
     public List<String> getRequirements() { return requirements; }
     public void setRequirements(List<String> requirements) { this.requirements = requirements; }
@@ -125,6 +129,7 @@ class ArchitectureResponse {
     private String id;
     private String recommendedStyle;
     private String proposedStyle;
+    private String reportStyle;
     private List<String> justification;
     private List<String> comparison;
     private double complexity;
@@ -146,6 +151,9 @@ class ArchitectureResponse {
 
     public String getProposedStyle() { return proposedStyle; }
     public void setProposedStyle(String proposedStyle) { this.proposedStyle = proposedStyle; }
+
+    public String getReportStyle() { return reportStyle; }
+    public void setReportStyle(String reportStyle) { this.reportStyle = reportStyle; }
 
     public List<String> getJustification() { return justification; }
     public void setJustification(List<String> justification) { this.justification = justification; }
@@ -284,16 +292,19 @@ class ArchitectureService {
 
         String description = safe(request.getProjectDescription(), "");
         List<String> requirements = request.getRequirements();
-        String style = arch.getStyle();
-        List<Component> components = arch.getComponents();
+        String recommendedStyle = safe(arch.getStyle(), "Monolithic");
+        String proposedStyle = safe(request.getProposedStyle(), "Monolithic");
+        boolean useSelectedForReport = Boolean.TRUE.equals(request.getUseSelectedArchitectureForReport());
+        String reportStyle = useSelectedForReport ? proposedStyle : recommendedStyle;
+        List<Component> components = generateComponents(reportStyle, requirements);
         String domain = safe(request.getDomain(), "General");
-    String projectName = deriveProjectName(request.getProjectName(), description, request.getProjectId());
+        String projectName = deriveProjectName(request.getProjectName(), description, request.getProjectId());
 
         // Step 2: launch all LLM-backed sections in parallel — each is bounded to 12s internally
         CompletableFuture<List<String>> justFuture = CompletableFuture.supplyAsync(
-                () -> generateJustificationLLM(description, requirements, style));
+            () -> generateJustificationLLM(description, requirements, reportStyle));
         CompletableFuture<List<String>> compFuture = CompletableFuture.supplyAsync(
-                () -> generateComparison(description, requirements, style, request.getProposedStyle()));
+            () -> generateComparison(description, requirements, recommendedStyle, proposedStyle));
         CompletableFuture<List<RequirementQuality>> qualFuture = CompletableFuture.supplyAsync(
                 () -> generateEnhancedQuality(request.getProjectId(), requirements));
         CompletableFuture<List<RequirementGap>> gapFuture = CompletableFuture.supplyAsync(
@@ -308,18 +319,19 @@ class ArchitectureService {
                 () -> generateNoveltyAssessment(description, domain, requirements));
 
         // DFD is computed locally — no LLM needed, completes immediately
-    DfdBundle dfdBundle = generateDfdBundle(projectName, description, requirements, style, components, domain);
+        DfdBundle dfdBundle = generateDfdBundle(projectName, description, requirements, reportStyle, components, domain);
         List<String> externalEntities = extractExternalEntities(description, requirements);
         List<GeneratedDiagram> additionalDiagrams = generateAdditionalDiagrams(
-                description, requirements, style, components, externalEntities
+            description, requirements, reportStyle, components, externalEntities
         );
 
         // Step 3: collect all parallel results (all bounded by 12s WebClient timeout + fallbacks)
         ArchitectureResponse response = new ArchitectureResponse();
         response.setId(arch.getId());
-        response.setRecommendedStyle(style);
-        response.setProposedStyle(safe(request.getProposedStyle(), "Monolithic"));
-        response.setComplexity(arch.getComplexity());
+        response.setRecommendedStyle(recommendedStyle);
+        response.setProposedStyle(proposedStyle);
+        response.setReportStyle(reportStyle);
+        response.setComplexity(calculateComplexity(components));
         response.setJustification(justFuture.join());
         response.setComparison(compFuture.join());
         response.setQualityAnalysis(qualFuture.join());
@@ -364,6 +376,10 @@ class ArchitectureService {
             request.setProjectId(UUID.randomUUID().toString());
         }
 
+        if (request.getUseSelectedArchitectureForReport() == null) {
+            request.setUseSelectedArchitectureForReport(Boolean.TRUE);
+        }
+
         if (request.getRequirements() == null) {
             request.setRequirements(List.of());
         } else {
@@ -400,7 +416,7 @@ class ArchitectureService {
     private String callLLMForRecommendation(String description, List<String> requirements) {
 
         String prompt = String.format("""
-You are a software architect. Analyze the project and recommend the best architecture.
+You are a software architect. Choose the single best architecture for this project.
 
 Project:
 %s
@@ -408,18 +424,22 @@ Project:
 Requirements:
 %s
 
-Candidate architectures:
-Microservices, Monolithic, Serverless, Event-Driven, Layered, SOA, Hexagonal, CQRS, P2P
+Valid architectures (pick exactly one):
+Microservices, Monolithic, Serverless, Event-Driven, Layered (N-Tier), SOA, Hexagonal, CQRS, Peer-to-Peer (P2P)
 
-Evaluation criteria:
-1. Scalability: Does the project need horizontal scaling or handle high concurrency?
-2. Coupling: Do requirements suggest independent deployable units or tightly coupled modules?
-3. Data flow: Is data flow event-based/streaming or request-response?
-4. Team size: Complex distributed systems need larger teams.
-5. Latency: Real-time requirements favor event-driven; simple CRUD favors monolithic.
-6. Compliance: Regulated domains may need clear boundaries (microservices/hexagonal).
+Decision factors:
+- Many independent features or bounded contexts → Microservices
+- Simple CRUD with few modules → Monolithic
+- Stateless event-triggered functions → Serverless
+- Real-time streaming or async messaging → Event-Driven
+- Clear presentation/business/data separation → Layered (N-Tier)
+- Enterprise integration across subsystems → SOA
+- Complex domain logic needing port/adapter isolation → Hexagonal
+- Separate read/write models with event sourcing → CQRS
+- Decentralized nodes with no central server → Peer-to-Peer (P2P)
+- Regulated domains needing audit boundaries → Microservices or Hexagonal
 
-Return ONLY the architecture name. No explanation.
+Return ONLY the architecture name from the list above. No explanation.
 """, safe(description, ""), formatRequirements(requirements));
 
         Map<String, Object> response = llmClient.callCustomPrompt(prompt);
@@ -434,7 +454,9 @@ Return ONLY the architecture name. No explanation.
 
     public List<String> generateJustificationLLM(String description, List<String> requirements, String recommended) {
         String prompt = String.format("""
-Explain why %s architecture is the best fit for this project.
+Give 3-5 reasons why %s architecture fits this project. Each reason must:
+- Reference a specific requirement or project characteristic
+- Be one concise sentence (max 30 words)
 
 Project:
 %s
@@ -442,9 +464,6 @@ Project:
 Requirements:
 %s
 
-For each reason, reference specific requirements or project characteristics.
-Cover these dimensions: scalability, maintainability, deployment flexibility, data management, and team productivity.
-Give 3-5 specific, actionable reasons.
 Return a JSON array of strings. No markdown, no prose outside the array.
 """, recommended, safe(description, ""), formatRequirements(requirements));
 
@@ -463,7 +482,7 @@ Return a JSON array of strings. No markdown, no prose outside the array.
         }
 
         String prompt = String.format("""
-Compare architectures:
+Compare these two architectures for this project.
 
 Project:
 %s
@@ -474,8 +493,8 @@ Requirements:
 Recommended: %s
 Proposed: %s
 
-Give EXACTLY 5 reasoning-based points why recommended is better.
-Return JSON array.
+Give exactly 5 comparison points. For each point, state which architecture is stronger and why (reference a requirement). Be objective — the proposed style may be better on some dimensions.
+Return a JSON array of 5 strings. No markdown.
 """, safe(description, ""), formatRequirements(requirements), recommended, proposed);
 
         Map<String, Object> response = llmClient.callCustomPrompt(prompt);
@@ -832,46 +851,32 @@ Return JSON array.
             String domain
     ) {
         return String.format("""
-You are a professional System Analyst.
-Generate a Level 0 Data Flow Diagram using Mermaid (flowchart syntax) and classical Yourdon/DeMarco DFD rules.
+Generate a Level 0 Data Flow Diagram in Mermaid flowchart syntax following Yourdon/DeMarco DFD rules.
 
-Project Name:
-%s
-
-Project Description:
-%s
-
-Domain:
-%s
+Project: %s
+Description: %s
+Domain: %s
+Architecture (context only): %s
+External Entities (seed list): %s
 
 Requirements:
 %s
 
-Architecture Style (context only):
-%s
+Level 0 rules:
+1) ONE central process: P0(("%s System"))
+2) Show ALL external entities with bidirectional data flows to P0
+3) NO internal subprocesses, NO data stores at Level 0
+4) Flow labels = business data names, not technical terms (no APIs/queues/microservices)
+5) Add any entities clearly implied by requirements even if not in seed list
 
-External Entities (seed list, refine if needed):
-%s
+Mermaid format:
+- flowchart LR
+- Entities: Exx["E#: Name"]
+- Process: P0(("%s System"))
+- Arrows: Exx -->|data| P0 and P0 -->|data| Exx
 
-STRICT RULES (must follow exactly):
-1) Use ALL requirements and the full project description as source of truth.
-2) Identify ALL external entities mentioned or clearly implied by requirements.
-3) Represent the whole system as ONE process only named exactly: "P0: %s System".
-4) Level 0 MUST include only: external entities, process P0, and data flows.
-5) Level 0 MUST NOT include internal subprocesses or any data store.
-6) Every external entity must have at least one inbound and one outbound data flow with P0.
-7) Flows must be meaningful business data (not technical implementation terms).
-8) Do NOT include AI/RAAG internals, backend APIs, queues, microservices, or infrastructure details.
-
-MERMAID FORMAT RULES:
-- Start with: flowchart LR
-- External entities: Exx["E#: Name"]
-- Main process: P0(("P0: %s System"))
-- Use arrows with labels: Exx -->|data| P0 and P0 -->|data| Exx
-
-Return only JSON:
-{"mermaid_code":"flowchart LR\\n..."}
-""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"), safe(projectName, "Project"));
+Return only JSON: {"mermaid_code":"flowchart LR\\n..."}
+""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), formatRequirements(requirements), safe(projectName, "Project"), safe(projectName, "Project"));
     }
 
     private String buildDfdLevel1Prompt(
@@ -883,47 +888,34 @@ Return only JSON:
             String domain
     ) {
         return String.format("""
-You are a professional System Analyst.
-Generate a Level 1 Data Flow Diagram using Mermaid (flowchart syntax) and classical Yourdon/DeMarco DFD rules.
+Generate a Level 1 Data Flow Diagram in Mermaid flowchart syntax following Yourdon/DeMarco DFD rules.
 
-Project Name:
-%s
-
-Project Description:
-%s
-
-Domain:
-%s
+Project: %s
+Description: %s
+Domain: %s
+Architecture (context only): %s
+External Entities (from Level 0): %s
 
 Requirements:
 %s
 
-Architecture Style (context only):
-%s
+Level 1 rules:
+1) Decompose P0 into domain processes P1..Pn (one per major feature area)
+2) Include data stores D1..Dn for all persisted data
+3) Every process must have at least one input and one output flow
+4) Keep Level 0 external entities consistent
+5) Flow labels = business data names, not technical terms
+6) Cover ALL functional requirements across the processes
 
-External Entities to stay consistent with Level 0:
-%s
-
-STRICT RULES (must follow exactly):
-1) Use ALL functional requirements; do not omit any requirement intent.
-2) Decompose "P0: %s System" into domain-specific processes P1..Pn.
-3) Ensure each process has meaningful inputs and outputs.
-4) Include ALL explicit or implied data stores as D1..Dn.
-5) Show proper data flows among external entities, processes, and data stores.
-6) Maintain consistency with Level 0 entities.
-7) Avoid technical architecture terms (APIs, microservices, queues, framework internals).
-8) Use clear business names and preserve complete requirement coverage.
-
-MERMAID FORMAT RULES:
-- Start with: flowchart LR
+Mermaid format:
+- flowchart LR
 - Entities: Exx["E#: Name"]
 - Processes: Pn(("Pn: Process Name"))
-- Data stores: Dn[("Dn: Data Store Name")]
-- Use labeled arrows for all flows.
+- Data stores: Dn[("Dn: Store Name")]
+- Labeled arrows for all flows
 
-Return only JSON:
-{"mermaid_code":"flowchart LR\\n..."}
-""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), formatRequirements(requirements), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), safe(projectName, "Project"));
+Return only JSON: {"mermaid_code":"flowchart LR\\n..."}
+""", safe(projectName, "Project"), safe(description, ""), safe(domain, "General"), safe(architectureStyle, "Architecture"), String.join(", ", externalEntities), formatRequirements(requirements), safe(projectName, "Project"));
     }
 
     private String buildLevel0MermaidFallback(List<String> externalEntities, String projectName) {
@@ -1770,8 +1762,75 @@ Return only JSON:
                 }
             }
 
+        } else if (normalized.contains("layer") || normalized.contains("n-tier") || normalized.contains("tier")) {
+            // Layered / N-Tier — show layers stacked inside a single server
+            sb.append("node \"Application Server\" {\n");
+            for (Component c : components) {
+                sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append(" <<").append(escapePlant(safe(c.getType(), "Layer"))).append(">>\n");
+            }
+            sb.append("}\n\n");
+            sb.append("database \"Database\" as DB\n");
+            sb.append("actor \"Client\" as Client\n\n");
+
+            components.stream().findFirst()
+                    .ifPresent(c -> sb.append("Client --> ").append(alias(c.getName())).append("\n"));
+
+            for (Component c : components) {
+                if (c.getDependencies() == null) continue;
+                for (String dep : c.getDependencies()) {
+                    if (dep == null || dep.isBlank()) continue;
+                    sb.append(alias(dep)).append(" --> ").append(alias(c.getName())).append("\n");
+                }
+            }
+            if (!components.isEmpty()) {
+                sb.append(alias(components.get(components.size() - 1).getName())).append(" --> DB\n");
+            }
+
+        } else if (normalized.contains("hexagonal") || normalized.contains("ports")) {
+            // Hexagonal / Ports & Adapters
+            sb.append("node \"Inbound Adapters\" {\n");
+            components.stream().filter(c -> c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("adapter") && c.getName().toLowerCase(Locale.ROOT).contains("inbound"))
+                    .forEach(c -> sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n"));
+            sb.append("}\n\n");
+            sb.append("node \"Application Core\" {\n");
+            components.stream().filter(c -> c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("core"))
+                    .forEach(c -> sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n"));
+            sb.append("}\n\n");
+            sb.append("node \"Outbound Adapters\" {\n");
+            components.stream().filter(c -> c.getType() != null && c.getType().toLowerCase(Locale.ROOT).contains("adapter") && c.getName().toLowerCase(Locale.ROOT).contains("outbound"))
+                    .forEach(c -> sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n"));
+            sb.append("}\n\n");
+            sb.append("database \"Database\" as DB\n");
+            sb.append("actor \"Client\" as Client\n\n");
+            components.stream().filter(c -> c.getName().toLowerCase(Locale.ROOT).contains("inbound")).findFirst()
+                    .ifPresent(c -> sb.append("Client --> ").append(alias(c.getName())).append("\n"));
+            for (Component c : components) {
+                if (c.getDependencies() == null) continue;
+                for (String dep : c.getDependencies()) {
+                    if (dep == null || dep.isBlank()) continue;
+                    sb.append(alias(dep)).append(" --> ").append(alias(c.getName())).append("\n");
+                }
+            }
+            components.stream().filter(c -> c.getName().toLowerCase(Locale.ROOT).contains("database")).findFirst()
+                    .ifPresent(c -> sb.append(alias(c.getName())).append(" --> DB\n"));
+
+        } else if (normalized.contains("peer") || normalized.contains("p2p")) {
+            // Peer-to-peer
+            sb.append("cloud \"P2P Network\" {\n");
+            for (Component c : components) {
+                sb.append("  node \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n");
+            }
+            sb.append("}\n\n");
+            for (Component c : components) {
+                if (c.getDependencies() == null) continue;
+                for (String dep : c.getDependencies()) {
+                    if (dep == null || dep.isBlank()) continue;
+                    sb.append(alias(dep)).append(" <--> ").append(alias(c.getName())).append("\n");
+                }
+            }
+
         } else {
-            // Monolithic / Layered
+            // Monolithic fallback
             sb.append("node \"Application Server\" {\n");
             for (Component c : components) {
                 sb.append("  artifact \"").append(escapePlant(c.getName())).append("\" as ").append(alias(c.getName())).append("\n");
@@ -1887,7 +1946,7 @@ Return only JSON:
             components.add(createComponent("Architecture Service", "Service", List.of("Analysis Service")));
             components.add(createComponent("Audit Service", "Service", List.of("API Gateway")));
             components.add(createComponent("Notification Service", "Service", List.of("Architecture Service")));
-        } else if (normalized.contains("event")) {
+        } else if (normalized.contains("event") || normalized.contains("cqrs")) {
             components.add(createComponent("API Gateway", "Gateway", List.of()));
             components.add(createComponent("Event Bus", "Messaging", List.of("API Gateway")));
             components.add(createComponent("Command Service", "Service", List.of("Event Bus")));
@@ -1899,7 +1958,33 @@ Return only JSON:
             components.add(createComponent("Auth Function", "Function", List.of("API Gateway")));
             components.add(createComponent("Analysis Function", "Function", List.of("API Gateway")));
             components.add(createComponent("Architecture Function", "Function", List.of("Analysis Function")));
+        } else if (normalized.contains("layer") || normalized.contains("n-tier") || normalized.contains("tier")) {
+            components.add(createComponent("Presentation Layer", "Layer", List.of()));
+            components.add(createComponent("Application Layer", "Layer", List.of("Presentation Layer")));
+            components.add(createComponent("Business Logic Layer", "Layer", List.of("Application Layer")));
+            components.add(createComponent("Data Access Layer", "Layer", List.of("Business Logic Layer")));
+            components.add(createComponent("Database Layer", "Layer", List.of("Data Access Layer")));
+        } else if (normalized.contains("soa") || normalized.contains("service-oriented")) {
+            components.add(createComponent("Enterprise Service Bus", "ESB", List.of()));
+            components.add(createComponent("Auth Service", "Service", List.of("Enterprise Service Bus")));
+            components.add(createComponent("Core Business Service", "Service", List.of("Enterprise Service Bus")));
+            components.add(createComponent("Integration Service", "Service", List.of("Enterprise Service Bus")));
+            components.add(createComponent("Reporting Service", "Service", List.of("Enterprise Service Bus")));
+            components.add(createComponent("Notification Service", "Service", List.of("Enterprise Service Bus")));
+        } else if (normalized.contains("hexagonal") || normalized.contains("ports")) {
+            components.add(createComponent("REST Adapter (Inbound)", "Adapter", List.of()));
+            components.add(createComponent("Application Core", "Core", List.of("REST Adapter (Inbound)")));
+            components.add(createComponent("Domain Model", "Core", List.of("Application Core")));
+            components.add(createComponent("Database Adapter (Outbound)", "Adapter", List.of("Domain Model")));
+            components.add(createComponent("Messaging Adapter (Outbound)", "Adapter", List.of("Application Core")));
+        } else if (normalized.contains("peer") || normalized.contains("p2p")) {
+            components.add(createComponent("Peer Discovery", "Service", List.of()));
+            components.add(createComponent("Peer Node A", "Peer", List.of("Peer Discovery")));
+            components.add(createComponent("Peer Node B", "Peer", List.of("Peer Discovery")));
+            components.add(createComponent("Peer Node C", "Peer", List.of("Peer Discovery")));
+            components.add(createComponent("Shared Ledger", "Storage", List.of("Peer Node A", "Peer Node B", "Peer Node C")));
         } else {
+            // Monolithic fallback
             components.add(createComponent("Main Application", "Monolith", List.of()));
             components.add(createComponent("Data Access Layer", "Layer", List.of("Main Application")));
             components.add(createComponent("Reporting Module", "Layer", List.of("Main Application")));

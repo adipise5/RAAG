@@ -4,6 +4,7 @@ const DEMO_PROJECT = {
   name: "MediTrack Patient Portal",
   description: "A web-based patient management portal for a mid-size private hospital. Patients can register, book appointments, access medical records, communicate with doctors via secure messaging, and receive automated prescription reminders. The hospital staff can manage schedules, update records, and generate compliance reports. The system must integrate with existing HL7 FHIR-compliant Electronic Health Record (EHR) systems and a third-party payment gateway for billing. High availability and HIPAA compliance are critical.",
   proposed_architecture: "Microservices",
+  use_selected_architecture_for_report: true,
   domain: "Healthcare",
   requirements: [
     { text: "The system shall allow patients to register using their email address and a password, verify their identity via a one-time code sent to their registered email within 2 minutes, and activate their account before they can access any portal features." },
@@ -28,6 +29,7 @@ const DEMO_PROJECT_B = {
   name: "EduFlow Corporate LMS",
   description: "A web-based Learning Management System for mid-to-large enterprises to manage internal employee training programs. HR managers can build a course catalog, assign courses to teams, and track completion. Employees access video lessons, take quizzes, and earn verifiable certificates. The platform must integrate with the company's existing identity provider via SAML 2.0 SSO, support SCORM-packaged third-party content, and scale to handle thousands of simultaneous learners during company-wide training rollouts.",
   proposed_architecture: "Layered (N-Tier)",
+  use_selected_architecture_for_report: true,
   domain: "Education",
   requirements: [
     { text: "The system shall authenticate employees using SAML 2.0 SSO integration with the company's identity provider (e.g., Okta, Azure AD), provisioning accounts automatically on first login without requiring manual HR setup." },
@@ -50,6 +52,7 @@ function ProjectForm({ onSubmit }) {
     name: '',
     description: '',
     proposed_architecture: 'Microservices',
+    use_selected_architecture_for_report: true,
     domain: 'General',
     requirements: [{ text: '' }]
   });
@@ -58,10 +61,10 @@ function ProjectForm({ onSubmit }) {
   const [isLoading, setIsLoading] = useState(false);
 
   const handleInputChange = (e) => {
-    const { name, value } = e.target;
+    const { name, value, type, checked } = e.target;
     setFormData(prev => ({
       ...prev,
-      [name]: value
+      [name]: type === 'checkbox' ? checked : value
     }));
   };
 
@@ -137,24 +140,14 @@ function ProjectForm({ onSubmit }) {
 
   return (
     <div className="form-container">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', paddingBottom: '12px', borderBottom: '1px solid #d6dde6' }}>
-        <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700, color: '#1f2937' }}>Create New Project</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', paddingBottom: '12px', borderBottom: '1px solid var(--c-border)' }}>
+        <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700, color: 'var(--c-text)' }}>Create New Project</h2>
         <div style={{ display: 'flex', gap: '8px' }}>
           <button
             type="button"
             onClick={loadDemo}
             title="Healthcare Patient Portal — Microservices"
-            style={{
-              background: '#f3f4f6',
-              color: '#1f2937',
-              border: '1px solid #d1d5db',
-              borderRadius: '4px',
-              padding: '8px 12px',
-              cursor: 'pointer',
-              fontWeight: 600,
-              fontSize: '0.82rem',
-              transition: 'none'
-            }}
+            className="demo-btn"
           >
             Demo A
           </button>
@@ -162,17 +155,7 @@ function ProjectForm({ onSubmit }) {
             type="button"
             onClick={loadDemoB}
             title="Corporate LMS — Layered N-Tier"
-            style={{
-              background: '#f3f4f6',
-              color: '#1f2937',
-              border: '1px solid #d1d5db',
-              borderRadius: '4px',
-              padding: '8px 12px',
-              cursor: 'pointer',
-              fontWeight: 600,
-              fontSize: '0.82rem',
-              transition: 'none'
-            }}
+            className="demo-btn"
           >
             Demo B
           </button>
@@ -236,6 +219,21 @@ function ProjectForm({ onSubmit }) {
             <option>CQRS + Event Sourcing</option>
             <option>Peer-to-Peer (P2P)</option>
           </select>
+        </div>
+
+        <div className="form-group" style={{ marginTop: '-8px', marginBottom: '18px' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', fontWeight: 500, fontSize: '0.88rem' }}>
+            <input
+              type="checkbox"
+              name="use_selected_architecture_for_report"
+              checked={formData.use_selected_architecture_for_report}
+              onChange={handleInputChange}
+            />
+            Use my selected architecture for report &amp; diagrams
+          </label>
+          <small style={{ color: 'var(--c-text-muted)', fontSize: '0.78rem', marginLeft: '28px', display: 'block' }}>
+            Diagrams and report sections will follow your selection above. An alternate LLM recommendation is still shown.
+          </small>
         </div>
 
         <div className="form-group">
