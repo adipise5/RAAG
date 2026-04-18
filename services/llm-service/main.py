@@ -17,13 +17,10 @@ app = FastAPI()
 # CONFIG
 # ==============================
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 MAX_LLM_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
-LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "8"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
 
 mongo_client = MongoClient(MONGO_URL)
 db = mongo_client["raag_projects"]
@@ -112,8 +109,6 @@ CATEGORY_SUGGESTION = {
 
 RISK_SEVERITY = {"low": "Low", "medium": "Medium", "high": "High", "critical": "Critical"}
 
-_gemini_model = None
-_gemini_disabled = False
 _ollama_ready = False  # set to True after model is confirmed available
 _ollama_semaphore: Optional[asyncio.Semaphore] = None  # limits concurrent Ollama calls
 
@@ -964,39 +959,6 @@ def build_combined_analysis_prompt(text: str) -> str:
 # ==============================
 # UNIFIED LLM ENGINE
 # ==============================
-def get_gemini_client():
-    global _gemini_model
-    if _gemini_model is not None:
-        return _gemini_model
-
-    from langchain_google_genai import ChatGoogleGenerativeAI
-
-    _gemini_model = ChatGoogleGenerativeAI(
-        model=GEMINI_MODEL,
-        google_api_key=GEMINI_API_KEY,
-        temperature=0.1
-    )
-    return _gemini_model
-
-
-async def call_gemini(prompt: str) -> str:
-    model = get_gemini_client()
-    response = await model.ainvoke(prompt)
-    content = getattr(response, "content", "")
-
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict):
-                parts.append(str(part.get("text") or part))
-            else:
-                parts.append(str(part))
-        return "\n".join(parts)
-
-    return str(content)
 
 
 # ==============================
@@ -1006,6 +968,7 @@ async def _pull_ollama_model_bg():
     """Pull the Ollama model in the background. Retries until Ollama is reachable."""
     global _ollama_ready
     import httpx
+    import json
     delay = 10
     attempt = 0
     while True:
@@ -1016,7 +979,12 @@ async def _pull_ollama_model_bg():
                 if ping.status_code != 200:
                     raise RuntimeError(f"Ollama ping returned {ping.status_code}")
 
-                tags = ping.json().get("models", [])
+                data = ping.json()
+                tags = []
+                if isinstance(data, list):
+                    tags = data
+                elif isinstance(data, dict):
+                    tags = data.get("models") or data.get("tags") or []
                 already_pulled = any(
                     m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0])
                     for m in tags
@@ -1026,19 +994,42 @@ async def _pull_ollama_model_bg():
                     _ollama_ready = True
                     return
 
-            logger.info("Pulling Ollama model '%s' — this may take a few minutes...", OLLAMA_MODEL)
+            logger.info("Pulling Ollama model '%s' — this may take a few minutes (4.7GB)...", OLLAMA_MODEL)
             async with httpx.AsyncClient(timeout=3600) as client:
                 async with client.stream(
                     "POST",
                     f"{OLLAMA_URL}/api/pull",
                     json={"name": OLLAMA_MODEL},
                 ) as resp:
+                    last_status = None
                     async for line in resp.aiter_lines():
-                        if '"status":"success"' in line:
-                            break
-            _ollama_ready = True
-            logger.info("Ollama model '%s' ready.", OLLAMA_MODEL)
-            return
+                        try:
+                            data = json.loads(line)
+                            status = data.get("status", "")
+                            if "percent" in data:
+                                # Progress update
+                                logger.info("Ollama pull: %s (%.1f%%)", status, data.get("completed", 0) / max(data.get("total", 1), 1) * 100)
+                            if status == "success":
+                                logger.info("Ollama model pull completed successfully")
+                                break
+                        except json.JSONDecodeError:
+                            pass
+            
+            # Verify model is actually available after pull completes
+            async with httpx.AsyncClient(timeout=15) as client:
+                verify = await client.get(f"{OLLAMA_URL}/api/tags")
+                data = verify.json()
+                tags = []
+                if isinstance(data, list):
+                    tags = data
+                elif isinstance(data, dict):
+                    tags = data.get("models") or data.get("tags") or []
+                if any(m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0]) for m in tags):
+                    _ollama_ready = True
+                    logger.info("Ollama model '%s' ready and verified.", OLLAMA_MODEL)
+                    return
+                else:
+                    raise RuntimeError("Model pull completed but model not found in tags")
         except Exception as exc:
             logger.warning("Ollama not yet reachable (attempt %d): %s — retrying in %ds", attempt, exc, delay)
             await asyncio.sleep(delay)
@@ -1141,6 +1132,7 @@ def fallback_from_prompt(prompt: str) -> Dict[str, Any]:
 async def call_llm(prompt: str) -> Dict[str, Any]:
     """
     Unified LLM entrypoint (required by architecture rules).
+    Uses local Ollama model (llama3.1:8b) with heuristic fallback.
     Always returns JSON-compatible dict.
     """
     clean_prompt = (prompt or "").strip()
@@ -1149,35 +1141,7 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
 
     last_error: Optional[str] = None
 
-    global _gemini_disabled
-
-    if GEMINI_API_KEY and not _gemini_disabled:
-        for attempt in range(MAX_LLM_RETRIES):
-            try:
-                raw = await asyncio.wait_for(call_gemini(clean_prompt), timeout=LLM_TIMEOUT_SECONDS)
-                parsed = extract_json_content(raw)
-                if isinstance(parsed, dict):
-                    return parsed
-                return {"result": parsed}
-            except Exception as exc:
-                last_error = str(exc)
-                logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, MAX_LLM_RETRIES, exc)
-
-                # Only permanently disable for auth/key errors, not transient rate-limits.
-                lower_err = last_error.lower()
-                if any(token in lower_err for token in [
-                    "api key", "unauthorized", "permission", "403", "401",
-                    "not found", "timed out", "timeout", "connection", "network", "dns", "max retries"
-                ]):
-                    _gemini_disabled = True
-                    break
-
-                if attempt < MAX_LLM_RETRIES - 1:
-                    await asyncio.sleep(0.6 * (2 ** attempt))
-
-    fallback = fallback_from_prompt(clean_prompt)
-
-    # --- Tier 2: local Ollama model (llama3.1:8b) ---
+    # --- Tier 1: local Ollama model (llama3.1:8b) ---
     if _ollama_ready:
         try:
             raw = await asyncio.wait_for(call_ollama(clean_prompt), timeout=OLLAMA_TIMEOUT_SECONDS)
@@ -1186,9 +1150,12 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
                 return parsed
             return {"result": parsed}
         except Exception as exc:
-            logger.warning("Ollama call failed, using heuristic fallback: %s", exc)
+            last_error = str(exc)
+            logger.warning("Ollama call failed: %s", exc)
 
-    # --- Tier 3: heuristic fallback ---
+    fallback = fallback_from_prompt(clean_prompt)
+
+    # --- Tier 2: heuristic fallback ---
     if last_error and isinstance(fallback, dict):
         fallback.setdefault("_fallback_reason", last_error)
     return fallback if isinstance(fallback, dict) else {"result": fallback}
@@ -1493,21 +1460,9 @@ async def analyze_requirement_pair(req_text: str) -> Tuple[str, Dict[str, Any], 
 
     combined_prompt = build_combined_analysis_prompt(req_text)
 
-    # Try Gemini first, then Ollama (same tier logic as call_llm but direct)
+    # Try Ollama first (primary local LLM)
     raw: Optional[str] = None
-    global _gemini_disabled
-    if GEMINI_API_KEY and not _gemini_disabled:
-        try:
-            raw = await asyncio.wait_for(call_gemini(combined_prompt), timeout=LLM_TIMEOUT_SECONDS)
-        except Exception as exc:
-            err_lower = str(exc).lower()
-            if any(t in err_lower for t in ["429", "quota", "resourceexhausted", "exceeded"]):
-                _gemini_disabled = True
-                logger.warning("Combined analysis: Gemini quota exhausted — disabling")
-            else:
-                logger.warning("Combined analysis: Gemini failed: %s", exc)
-
-    if raw is None and _ollama_ready:
+    if _ollama_ready:
         try:
             raw = await asyncio.wait_for(call_ollama(combined_prompt), timeout=OLLAMA_TIMEOUT_SECONDS)
         except Exception as exc:
@@ -1956,7 +1911,6 @@ def _extract_plantuml(raw: str) -> Optional[str]:
 @app.post("/generate-diagram")
 async def generate_diagram(request: DiagramRequest):
     try:
-        global _gemini_disabled
         prompt = (request.prompt or "").strip()
         diagram_type = (request.diagram_type or "component").strip().lower()
 
@@ -1966,21 +1920,8 @@ async def generate_diagram(request: DiagramRequest):
         plantuml_code: Optional[str] = None
         llm_prompt = build_diagram_prompt(prompt, diagram_type)
 
-        # Tier 1: Gemini
-        if GEMINI_API_KEY and not _gemini_disabled:
-            try:
-                raw = await asyncio.wait_for(call_gemini(llm_prompt), timeout=LLM_TIMEOUT_SECONDS)
-                plantuml_code = _extract_plantuml(raw)
-            except Exception as exc:
-                err_lower = str(exc).lower()
-                if any(t in err_lower for t in ["429", "quota", "resourceexhausted", "exceeded"]):
-                    _gemini_disabled = True
-                    logger.warning("Diagram: Gemini quota exhausted — disabling for this session")
-                else:
-                    logger.warning("Diagram Gemini call failed: %s", exc)
-
-        # Tier 2: Ollama (tried even when Gemini is disabled/absent)
-        if not plantuml_code and _ollama_ready:
+        # Tier 1: Ollama (local LLM)
+        if _ollama_ready:
             try:
                 raw = await asyncio.wait_for(call_ollama(llm_prompt), timeout=OLLAMA_TIMEOUT_SECONDS)
                 plantuml_code = _extract_plantuml(raw)
@@ -2081,22 +2022,8 @@ async def chat_endpoint(request: ChatRequest):
 
         response_text: Optional[str] = None
 
-        if GEMINI_API_KEY and not _gemini_disabled:
-            try:
-                prompt = build_chat_prompt(question, context)
-                response_text = await asyncio.wait_for(
-                    call_gemini(prompt), timeout=LLM_TIMEOUT_SECONDS
-                )
-            except Exception as exc:
-                err_lower = str(exc).lower()
-                if any(t in err_lower for t in ["429", "quota", "resourceexhausted", "exceeded"]):
-                    _gemini_disabled = True
-                    logger.warning("Chat: Gemini quota exhausted — disabling for this session")
-                else:
-                    logger.warning("Chat Gemini call failed: %s", exc)
-
-        # Fallback to local Ollama model if Gemini unavailable
-        if not response_text and _ollama_ready:
+        # Use local Ollama model for chat
+        if _ollama_ready:
             try:
                 prompt = build_chat_prompt(question, context)
                 response_text = await asyncio.wait_for(
@@ -2104,7 +2031,7 @@ async def chat_endpoint(request: ChatRequest):
                 )
                 logger.info("Chat served by local Ollama model.")
             except Exception as exc:
-                logger.warning("Chat Ollama call failed: %s", exc)
+                logger.warning("Chat Ollama call failed: %r", exc)
 
         if not response_text:
             response_text = (
@@ -2131,8 +2058,6 @@ async def health():
         "status": "ok",
         "service": "llm",
         "llm_ready": True,
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "gemini_model": GEMINI_MODEL,
         "ollama_ready": _ollama_ready,
         "ollama_model": OLLAMA_MODEL,
         "ollama_url": OLLAMA_URL

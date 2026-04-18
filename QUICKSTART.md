@@ -40,9 +40,7 @@ cd raag-project
 
 # Copy environment template
 cp .env.example .env
-
-# (Optional) Add Gemini API key for AI features
-# Edit .env and add: GEMINI_API_KEY=your_key_here
+# No API keys needed - uses local Ollama LLM
 ```
 
 ### Step 3: Start Services
@@ -139,9 +137,8 @@ df -h
 ## 🚀 Next Steps
 
 1. **[Read Full README](./README.md)** - Complete documentation
-2. **[Add Gemini API Key](./README.md#-adding-your-gemini-api-key)** - Enable AI features
-3. **[Explore API Endpoints](./README.md#-api-endpoints)** - Test REST API
-4. **[View Architecture](./README.md#-architecture-overview)** - Understand the system
+2. **[Explore API Endpoints](./README.md#-api-endpoints)** - Test REST API
+3. **[View Architecture](./README.md#-architecture-overview)** - Understand the system
 
 ---
 
@@ -168,7 +165,7 @@ docker-compose up -d
 ## ✨ Features at a Glance
 
 ✅ **10 Microservices** - Production-grade polyglot architecture  
-✅ **AI-Powered** - LLM integration ready (Gemini, local Ollama)  
+✅ **AI-Powered** - Local Ollama LLM integration (no API keys needed)  
 ✅ **Real-time Chat** - WebSocket-based chatbot  
 ✅ **PDF Export** - Professional report generation  
 ✅ **Audit Trail** - High-performance event logging  

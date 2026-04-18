@@ -45,7 +45,6 @@ cd raag-project
 2. **Create `.env` file in root directory:**
 ```bash
 cat > .env << EOF
-GEMINI_API_KEY=your-gemini-api-key-here
 COMPOSE_PROJECT_NAME=raag
 EOF
 ```
@@ -60,6 +59,7 @@ This will:
 - Start databases (MongoDB, PostgreSQL, Redis, RabbitMQ)
 - Launch all services
 - Start the React frontend
+- Pull and configure the local Ollama LLM model
 
 4. **Wait for services to be ready (~2-3 minutes):**
 ```bash
@@ -141,27 +141,6 @@ cd services/ingestion-service
 pip install -r requirements.txt
 python main.py
 ```
-
-## 🔌 Adding Your Gemini API Key
-
-Once you have a [Google Gemini API Key](https://aistudio.google.com/app/apikey):
-
-1. **Update `.env` file:**
-```bash
-GEMINI_API_KEY=sk_live_your_actual_key_here
-```
-
-2. **Restart services:**
-```bash
-docker-compose down
-docker-compose up -d
-```
-
-3. **LLM Service will now use real Gemini models** for:
-   - Requirement classification
-   - Architecture recommendations
-   - Gap analysis
-   - Quality assessment
 
 ## 📊 API Endpoints
 

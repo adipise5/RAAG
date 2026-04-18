@@ -16,7 +16,7 @@ if [ ! -f .env ]; then
     echo -e "${YELLOW}⚠️  .env file not found${NC}"
     echo "Creating .env from .env.example..."
     cp .env.example .env
-    echo -e "${YELLOW}📝 Please edit .env and add your GEMINI_API_KEY${NC}\n"
+    echo -e "${GREEN}✓ .env created (no API keys required - uses local Ollama LLM)${NC}\n"
 fi
 
 # Check Docker

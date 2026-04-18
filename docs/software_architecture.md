@@ -10,9 +10,9 @@
 
 # 2. Abstract
 
-The Requirement Analysis and Architecture Generator (RAAG) addresses a recurring challenge in software engineering education and practice: translating natural-language requirements into measurable quality assessments and implementable software architecture decisions. The project objective is to provide an integrated platform that ingests project requirements, classifies them (FR/NFR), evaluates requirement quality (aligned to IEEE 830 principles), identifies gaps and risks, recommends architecture styles, generates architectural artifacts (including DFDs and traceability outputs), and xexports professional reports.
+The Requirement Analysis and Architecture Generator (RAAG) addresses a recurring challenge in software engineering education and practice: translating natural-language requirements into measurable quality assessments and implementable software architecture decisions. The project objective is to provide an integrated platform that ingests project requirements, classifies them (FR/NFR), evaluates requirement quality (aligned to IEEE 830 principles), identifies gaps and risks, recommends architecture styles, generates architectural artifacts (including DFDs and traceability outputs), and exports professional reports.
 
-The scope covers an end-to-end polyglot microservices system with a React frontend and ten backend services across Node.js, Python, Go, Java, and Rust. The system includes synchronous API interactions, asynchronous event publication through RabbitMQ, persistence across MongoDB/PostgreSQL, Redis-backed caching/session support, AI-assisted analysis via Gemini/Ollama pathways, and containerized deployment through Docker Compose.
+The scope covers an end-to-end polyglot microservices system with a React frontend and ten backend services across Node.js, Python, Go, Java, and Rust. The system includes synchronous API interactions, asynchronous event publication through RabbitMQ, persistence across MongoDB/PostgreSQL, Redis-backed caching/session support, AI-assisted analysis via local Ollama LLM, and containerized deployment through Docker Compose.
 
 Key features include requirement ingestion, AI-based semantic analysis, quality scoring, architecture recommendation, traceability matrix generation, risk/novelty/complexity estimation, real-time chatbot support, audit observability, and PDF/HTML export.
 
@@ -494,7 +494,7 @@ Current and target deployment models:
 | Databases | MongoDB, PostgreSQL, Redis |
 | Messaging | RabbitMQ |
 | Containers | Docker, Docker Compose |
-| AI Integration | Gemini API, Ollama (optional local model) |
+| AI Integration | Ollama (local LLM - no external API keys required) |
 
 ---
 

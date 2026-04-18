@@ -149,10 +149,9 @@ services:
       PORT: 8002
       MONGO_URL: mongodb://admin:password@mongodb:27017
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-placeholder}
-      GEMINI_MODEL: gemini-2.0-flash-lite
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: llama3.1:8b
+      OLLAMA_TIMEOUT_SECONDS: 120
     networks:
       - raag-network
 
@@ -255,9 +254,10 @@ services:
     networks:
       - raag-network
 
-  # Local LLM — Ollama (llama3.1:8b, ~4.7 GB VRAM, fits RTX 4060 8 GB)
-  # Requires NVIDIA Container Toolkit on the host:
+  # Local LLM — Ollama (llama3.1:8b)
+  # Supports GPU acceleration on NVIDIA (requires NVIDIA Container Toolkit):
   #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  # On Mac (M1/M2/M3/M4) or CPU-only systems, runs efficiently with CPU
   # The model is pulled automatically on first start (background, ~4.7 GB download).
   ollama:
     image: ollama/ollama:latest
@@ -265,13 +265,14 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # GPU acceleration is optional - uncomment the deploy section below to enable NVIDIA GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
     networks:
       - raag-network
 
