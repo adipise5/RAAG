@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import io from 'socket.io-client';
+import ReactMarkdown from 'react-markdown';
 
 function Chatbot({ projectId, apiUrl }) {
   const [messages, setMessages] = useState([]);
@@ -145,8 +146,8 @@ function Chatbot({ projectId, apiUrl }) {
               </div>
             </div>
             <div className="message bot">
-              <div className="message-content">
-                {msg.botResponse}
+              <div className="message-content bot-markdown">
+                <ReactMarkdown>{msg.botResponse}</ReactMarkdown>
               </div>
             </div>
           </div>
