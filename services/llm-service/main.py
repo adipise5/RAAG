@@ -669,11 +669,7 @@ def build_json_prompt(
     output_schema: Dict[str, Any],
     example_output: Any
 ) -> str:
-    """
-    Compact prompt template.  Keeps <INPUT_JSON> tags so fallback_from_prompt
-    can still extract the inputs if both LLMs fail.
-    Example alone implies the schema — no need to duplicate it.
-    """
+    """Compact prompt template; keeps <INPUT_JSON> tags for fallback parsing."""
     return (
         f"TASK: {task}\n"
         f"Objective: {objective}\n"
@@ -902,11 +898,7 @@ def build_novelty_prompt(project_description: str, requirements: List[str], doma
 
 
 def build_combined_analysis_prompt(text: str) -> str:
-    """
-    Single-shot prompt that returns BOTH classification AND quality analysis for
-    one requirement.  Cuts LLM calls per requirement from 2 → 1.
-    Structured with explicit rules for reliable 7B-model output.
-    """
+    """Single-shot prompt combining classification and quality analysis for one requirement."""
     return (
         "Classify and score this software requirement. Return ONLY valid JSON.\n\n"
         f"Requirement: {json.dumps(text)}\n\n"
@@ -1014,22 +1006,15 @@ async def _pull_ollama_model_bg():
 @app.on_event("startup")
 async def startup_event():
     global _ollama_semaphore
-    # Allow at most 8 concurrent Ollama calls — q5_0 quantization fits comfortably on RTX 4060 8GB
+    # Limit concurrent Ollama calls
     _ollama_semaphore = asyncio.Semaphore(8)
     asyncio.create_task(_pull_ollama_model_bg())
 
 
 async def call_ollama(prompt: str) -> str:
-    """
-    Send a plain prompt to the local Ollama model and return the text response.
-    Uses the OpenAI-compatible /v1/chat/completions endpoint.
-    Concurrency is limited by _ollama_semaphore (≤8 simultaneous calls).
-    num_ctx auto-scales: short prompts (per-requirement) use 1024,
-    longer prompts (DFD/traceability/gap) use 2048 for full context.
-    """
+    """Send a prompt to the local Ollama model and return the text response."""
     import httpx
     sem = _ollama_semaphore or asyncio.Semaphore(4)
-    # Auto-scale context window: short prompts fit 1024, long ones need 2048
     estimated_tokens = len(prompt) // 3  # rough char-to-token ratio
     num_ctx = 2048 if estimated_tokens > 600 else 1024
     async with sem:
@@ -1037,7 +1022,7 @@ async def call_ollama(prompt: str) -> str:
             "model": OLLAMA_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "keep_alive": -1,     # pin model in VRAM indefinitely — eliminates cold-start reload between requests
+            "keep_alive": -1,
             "options": {
                 "temperature": 0.0,   # fully deterministic — faster + more consistent JSON
                 "num_ctx": num_ctx,

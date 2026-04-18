@@ -470,8 +470,6 @@
   border: 1px solid var(--c-border);
   border-bottom-left-radius: 4px;
 }
-
-/* ---- Bot markdown formatting ---- */
 .bot-markdown h1, .bot-markdown h2, .bot-markdown h3 {
   margin: 14px 0 6px;
   font-weight: 700;
